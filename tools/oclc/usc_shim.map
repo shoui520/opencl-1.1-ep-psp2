@@ -1,0 +1,9 @@
+{
+  global:
+    PVRUniFlexCreateContext;
+    PVRUniFlexCompileToUspBin;
+    PVRUniFlexDestroyUspBin;
+    PVRUniFlexDestroyContext;
+    usc_shim_program_index;
+  local: *;
+};
