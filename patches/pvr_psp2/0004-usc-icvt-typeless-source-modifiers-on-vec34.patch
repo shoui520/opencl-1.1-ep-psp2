@@ -1,0 +1,71 @@
+USC: don't apply integer source modifiers twice on vector cores
+
+GetSourceTypeless unpacks a channel of a vector register into a scalar for
+integer instructions on SGX543/544.  It copied the source's negate/absolute
+modifier onto the unpack and also returned it to the caller, so the modifier
+was applied twice, the first time with floating point semantics (the unpack
+became VMUL src, 1.0).  ExpandSUB turns every integer "a - b" into
+"a + -b", so e.g. OpenCL get_group_id(0) = gid - offset computed
+gid + (offset ^ 0x80000000).  Make the unpack a plain copy and leave the
+modifiers to the caller.
+
+Callers that cannot take modifiers still get an absolute modifier applied by
+the unpack: the NZBIT flow control tests use it so that -0.0 tests as zero.
+Their negate modifier inverts the test, which DoFlowControlTest already does,
+so it is no longer also applied to the value (if (!x) on x = 0.0 tested
+-0.0, i.e. non-zero bits).  Assert that no other such caller gets a negate.
+
+diff --git a/tools/intern/usc2/icvt_core.c b/tools/intern/usc2/icvt_core.c
+index 21028a3..21b9a29 100644
+--- a/tools/intern/usc2/icvt_core.c
++++ b/tools/intern/usc2/icvt_core.c
+@@ -7946,6 +7946,7 @@ static IMG_VOID DoFlowControlTest(	PINTERMEDIATE_STATE psState,
+ 		case UFOP_IFNZBIT:
+ 		{
+ 			PINST		psInst = AllocateInst(psState, IMG_NULL);
++			UF_REGISTER	sTestSrc;
+ 			ASSERT(GetRegisterFormat(psState, &psFirstInst->asSrc[uArg]) == UF_REGFORMAT_F32);
+ 
+ 			/* Create a test instruction to check for non-zero bits. */
+@@ -7953,10 +7954,13 @@ static IMG_VOID DoFlowControlTest(	PINTERMEDIATE_STATE psState,
+ 			psInst->u.psTest->eAluOpcode = IOR;
+ 			MakePredicateArgument(&psInst->asDest[TEST_PREDICATE_DESTIDX], USC_PREDREG_TEMP);
+ 			psInst->u.psTest->sTest.eType = TEST_TYPE_NEQ_ZERO;
++			/* A negate modifier inverts the test (below), it doesn't apply to the value. */
++			sTestSrc = psFirstInst->asSrc[uArg];
++			sTestSrc.byMod &= ~UFREG_SOURCE_NEGATE;
+ 			/* Get the intermediate version of the source for comparison. */
+ 			GetSourceTypeless(psState,
+ 							  psBlock,
+-							  &psFirstInst->asSrc[uArg], 
++							  &sTestSrc, 
+ 						 	  //0,
+ 							  UFREG_SWIZ_Z, 
+ 							  &psInst->asArg[0], 
+diff --git a/tools/intern/usc2/icvt_i32.c b/tools/intern/usc2/icvt_i32.c
+index 39dd649..f02c5a7 100644
+--- a/tools/intern/usc2/icvt_i32.c
++++ b/tools/intern/usc2/icvt_i32.c
+@@ -90,9 +90,21 @@ IMG_VOID GetSourceTypeless(PINTERMEDIATE_STATE psState,
+ 						 psUnpackVec,
+ 						 0 /* uSrcIdx */);
+ 
+-		psUnpackVec->u.psVec->auSwizzle[0] = 
++		psUnpackVec->u.psVec->auSwizzle[0] =
+ 			CombineSwizzles(ConvertSwizzle(psState, psSource->u.uSwiz), g_auReplicateSwizzles[uChan]);
+ 
++		/*
++			The unpack is a bit copy of typeless data.  A negate here would be
++			applied with floating point semantics, and the modifiers are
++			returned to callers that allow them.  Callers that don't get an
++			absolute modifier applied by the unpack (clearing the sign bit, as
++			the NZBIT flow control tests want for -0.0) and no negates.
++		*/
++		psUnpackVec->u.psVec->asSrcMod[0].bNegate = IMG_FALSE;
++		psUnpackVec->u.psVec->asSrcMod[0].bAbs =
++			!bAllowSourceMod && (psSource->byMod & UFREG_SOURCE_ABS) != 0;
++		ASSERT(bAllowSourceMod || (psSource->byMod & UFREG_SOURCE_NEGATE) == 0);
++
+ 		AppendInst(psState, psCodeBlock, psUnpackVec);
+ 
+ 		/*

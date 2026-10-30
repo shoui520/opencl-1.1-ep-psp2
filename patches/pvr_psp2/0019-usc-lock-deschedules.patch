@@ -1,0 +1,21 @@
+USC: a mutex lock deschedules
+
+USP counts LOCK among the instructions which always deschedule, so internal
+registers can't be live across one, but IsDeschedAfterInst didn't include
+ILOCK and internal register allocation could keep a value in one across the
+lock of an atomic.  USP then failed to finalise the program ("Internal
+registers live after descheduling instruction"), e.g. for atomics in a loop.
+
+diff --git a/tools/intern/usc2/inst_usc.c b/tools/intern/usc2/inst_usc.c
+index a971428..1dc18e7 100644
+--- a/tools/intern/usc2/inst_usc.c
++++ b/tools/intern/usc2/inst_usc.c
+@@ -17524,6 +17524,8 @@ IMG_BOOL IsDeschedAfterInst(PCINST psInst)
+ 			#if defined(OUTPUT_USPBIN)
+ 			psInst->eOpcode == ITEXWRITE ||
+ 			#endif //defined(OUTPUT_USPBIN)
++			/* USP treats LOCK as always descheduling */
++			psInst->eOpcode == ILOCK ||
+ 			psInst->eOpcode == IIDF
+ 	   )
+ 	{

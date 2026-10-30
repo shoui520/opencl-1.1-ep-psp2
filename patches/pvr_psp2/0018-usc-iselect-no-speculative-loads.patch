@@ -1,0 +1,27 @@
+USC: don't flatten conditional arms containing memory loads
+
+CanPredicate refused to predicate the hardware load instructions but not
+ILOADMEMCONST, which every OpenCL MEMLD becomes before finalisation.  So an
+arm holding a load could be flattened, and with the MOVC form both arms run
+unconditionally: "p == 0 ? 1 : p[0]" loaded from a null pointer and faulted
+the GPU.  Treat ILOADMEMCONST like the other loads.
+
+diff --git a/tools/intern/usc2/iselect.c b/tools/intern/usc2/iselect.c
+index 034dcfe..0457046 100644
+--- a/tools/intern/usc2/iselect.c
++++ b/tools/intern/usc2/iselect.c
+@@ -13365,7 +13365,13 @@ static IMG_BOOL CanPredicate(PINTERMEDIATE_STATE psState,
+ 		}
+ 	}
+ 
+-	if (eOpcode == ILDAB ||
++	/*
++		ILOADMEMCONST is an OpenCL global memory load: flattening its arm into
++		a MOVC would run it unconditionally, and a guarded load (a null or
++		out-of-range pointer) then faults the GPU.
++	*/
++	if (eOpcode == ILOADMEMCONST ||
++	eOpcode == ILDAB ||
+ 	eOpcode == ILDAW ||
+ 	eOpcode == ILDAD ||
+ 	eOpcode == ILDLD ||

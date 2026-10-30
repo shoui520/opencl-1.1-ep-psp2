@@ -1,0 +1,55 @@
+USC: float to 8-bit integer conversion on cores with the vector instruction set
+
+ConvertF32ConversionInstructionInt8 always emitted the scalar PCKU8F32/
+PCKS8F32, which SGX543/544 do not have, so any program converting a float
+to a char/uchar (e.g. OpenCL convert_uchar_sat) failed in the assembler with
+"The pcku8f32 instruction isn't supported on this core".  Use the vector
+packs on those cores, as ConvertF32ConversionInstructionInt16 already does.
+The source is already rounded towards zero (ExpandMOV inserts TRC/FLR), so
+the pack's rounding mode does not matter.
+
+diff --git a/tools/intern/usc2/icvt_i32.c b/tools/intern/usc2/icvt_i32.c
+index 62a43a0..b37add9 100644
+--- a/tools/intern/usc2/icvt_i32.c
++++ b/tools/intern/usc2/icvt_i32.c
+@@ -3449,12 +3458,36 @@ IMG_VOID ConvertF32ConversionInstructionInt8(PINTERMEDIATE_STATE		psState,
+ 		Convert from floating point to integer.
+ 	*/
+ 	psPckInst = AllocateInst(psState, NULL);
+-	SetOpcode(psState, psPckInst, bSigned ? IPCKS8F32 : IPCKU8F32);
++	#if defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554)
++	if ((psState->psTargetFeatures->ui32Flags & SGX_FEATURE_FLAGS_USE_VEC34) != 0)
++	{
++		IMG_UINT32	uChan;
++
++		/*
++			The scalar pack instructions aren't available on cores with the
++			vector instruction set.
++		*/
++		SetOpcode(psState, psPckInst, bSigned ? IVPCKS8FLT : IVPCKU8FLT);
++
++		SetSrcUnused(psState, psPckInst, 0 /* uSrcIdx */);
++		SetSrcFromArg(psState, psPckInst, 1 /* uSrcIdx */, psArg);
++		for (uChan = 1; uChan < VECTOR_LENGTH; uChan++)
++		{
++			SetSrcUnused(psState, psPckInst, 1 + uChan);
++		}
++		psPckInst->u.psVec->auSwizzle[0] = USEASM_SWIZZLE(X, X, X, X);
++		psPckInst->u.psVec->aeSrcFmt[0] = UF_REGFORMAT_F32;
++	}
++	else
++	#endif /* defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554) */
++	{
++		SetOpcode(psState, psPckInst, bSigned ? IPCKS8F32 : IPCKU8F32);
++		psPckInst->asArg[0] = *psArg;
++		psPckInst->asArg[1].uType = USEASM_REGTYPE_IMMEDIATE;
++		psPckInst->asArg[1].uNumber = 0;
++	}
+ 	psPckInst->asDest[0] = *psDest;
+ 	SetPredicate(psState, psPckInst, uPredSrc, bPredNegate);
+-	psPckInst->asArg[0] = *psArg;
+-	psPckInst->asArg[1].uType = USEASM_REGTYPE_IMMEDIATE;
+-	psPckInst->asArg[1].uNumber = 0;
+ 	AppendInst(psState, psCodeBlock, psPckInst);
+ }
+ 

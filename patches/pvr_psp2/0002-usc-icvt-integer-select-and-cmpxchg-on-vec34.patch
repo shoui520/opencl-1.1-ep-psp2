@@ -1,0 +1,109 @@
+USC: integer MOVCBIT/ATOM_CMPXCHG on cores with the vector instruction set
+
+The integer converter hands MOVCBIT and ATOM_CMPXCHG to
+ConvertComparisonInstructionF32, which used the scalar F32 register
+accessors.  On SGX543/544 integer registers live in vector registers, so a
+select whose operand came from a plain copy read the wrong register and the
+result was taken from a stale scratch register: e.g. "c ? a : b" became
+"b" with no diagnostic.  Use the typeless (unpack/pack) accessors for these
+opcodes, as the rest of the integer converter does, and do the same for the
+duplicate-channel moves in ConvertBitwiseInstructionF32.
+
+ATOM_CMPXCHG also tested (old ^ compare) with the float MOVC, which treats
+-0 and denormal bit patterns as zero, so the exchange could happen when the
+values differ.  Use the 32-bit integer MOVC.
+
+diff --git a/tools/intern/usc2/icvt_f32.c b/tools/intern/usc2/icvt_f32.c
+index d407e18..f1bf43c 100644
+--- a/tools/intern/usc2/icvt_f32.c
++++ b/tools/intern/usc2/icvt_f32.c
+@@ -1651,10 +1651,10 @@ IMG_VOID ConvertBitwiseInstructionF32(PINTERMEDIATE_STATE psState, PCODEBLOCK ps
+ 
+ 			psMoveInst = AllocateInst(psState, IMG_NULL);
+ 			SetOpcode(psState, psMoveInst, IMOV);
+-			GetDestinationF32(psState, psCodeBlock, &psSrc->sDest, i, &psMoveInst->asDest[0]);
++			GetDestinationTypeless(psState, psCodeBlock, &psSrc->sDest, i, &psMoveInst->asDest[0]);
+ 			if (puRepDest[i] != UINT_MAX)
+ 			{
+-				GetDestinationF32(psState, psCodeBlock, &psSrc->sDest, puRepDest[i], &psMoveInst->asArg[0]);
++				GetDestinationTypeless(psState, psCodeBlock, &psSrc->sDest, puRepDest[i], &psMoveInst->asArg[0]);
+ 			}
+ 			else
+ 			{
+@@ -2641,6 +2641,17 @@ IMG_VOID ConvertComparisonInstructionF32(PINTERMEDIATE_STATE psState, PCODEBLOCK
+ 	TEST_TYPE eTest;
+ 	IMG_UINT32 uTrueSrc;
+ 	const IMG_BOOL bAtomic = psSrc->eOpCode == UFOP_ATOM_CMPXCHG;
++	/*
++		MOVCBIT and ATOM_CMPXCHG also arrive here from the integer converter.
++		Their operands are integer registers, which on cores with the vector
++		instruction set live in vector registers: read and write them through
++		the typeless accessors (unpack/pack) like other integer instructions.
++	*/
++	const IMG_BOOL bTypeless = (psSrc->eOpCode == UFOP_MOVCBIT || bAtomic) ? IMG_TRUE : IMG_FALSE;
++	IMG_VOID (*pfnGetSource)(PINTERMEDIATE_STATE, PCODEBLOCK, PUF_REGISTER, IMG_UINT32, PARG, IMG_BOOL,
++							 PFLOAT_SOURCE_MODIFIER) = bTypeless ? GetSourceTypeless : GetSourceF32;
++	IMG_VOID (*pfnGetDest)(PINTERMEDIATE_STATE, PCODEBLOCK, PUF_REGISTER, IMG_UINT32, PARG) =
++		bTypeless ? GetDestinationTypeless : GetDestinationF32;
+ 	ARG sAddress;
+ 	ARG sOldValue;
+ 	InitInstArg(&sOldValue);
+@@ -2728,8 +2739,8 @@ IMG_VOID ConvertComparisonInstructionF32(PINTERMEDIATE_STATE psState, PCODEBLOCK
+ 		/*
+ 			For CMP/CND/MOVCBIT/ATOM_CMPXCHG get the additional sources and apply any source modifiers.
+ 		*/
+-		GetSourceF32(psState, psCodeBlock, &psSrc->asSrc[1], i, &sSrc1, IMG_FALSE, NULL);
+-		GetSourceF32(psState, psCodeBlock, &psSrc->asSrc[2], i, &sSrc2, IMG_FALSE, NULL);
++		pfnGetSource(psState, psCodeBlock, &psSrc->asSrc[1], i, &sSrc1, IMG_FALSE, NULL);
++		pfnGetSource(psState, psCodeBlock, &psSrc->asSrc[2], i, &sSrc2, IMG_FALSE, NULL);
+ 
+ 		ApplyMultiformatSourceMod(psState, psCodeBlock, &psSrc->asSrc[1], &sSrc1);
+ 		ApplyMultiformatSourceMod(psState, psCodeBlock, &psSrc->asSrc[2], &sSrc2);
+@@ -2758,7 +2769,7 @@ IMG_VOID ConvertComparisonInstructionF32(PINTERMEDIATE_STATE psState, PCODEBLOCK
+ 		}
+ 		else
+ 		{
+-			GetSourceF32(psState, psCodeBlock, &psSrc->asSrc[0], i, &sSrc0, IMG_FALSE, NULL);
++			pfnGetSource(psState, psCodeBlock, &psSrc->asSrc[0], i, &sSrc0, IMG_FALSE, NULL);
+ 
+ 			/* We need to load the argument and generate the condition register */
+ 			if (psSrc->eOpCode == UFOP_ATOM_CMPXCHG)
+@@ -2802,7 +2813,15 @@ IMG_VOID ConvertComparisonInstructionF32(PINTERMEDIATE_STATE psState, PCODEBLOCK
+ 		}
+ 		else
+ 		{
+-			if (psSrc->eOpCode == UFOP_MOVCBIT)
++			if (bAtomic)
++			{
++				/*
++					The test is on (old ^ compare) as a 32-bit integer; the float
++					MOVC would treat -0 and denormal bit patterns as zero.
++				*/
++				SetOpcode(psState, psInst, IMOVC_I32);
++			}
++			else if (psSrc->eOpCode == UFOP_MOVCBIT)
+ 			{
+ 				if (psState->uCompilerFlags & UF_OPENCL)
+ 				{
+@@ -2848,7 +2867,7 @@ IMG_VOID ConvertComparisonInstructionF32(PINTERMEDIATE_STATE psState, PCODEBLOCK
+ 		}
+ 		else
+ 		{
+-			GetDestinationF32(psState, psCodeBlock, &psSrc->sDest, i, &psInst->asDest[0]);
++			pfnGetDest(psState, psCodeBlock, &psSrc->sDest, i, &psInst->asDest[0]);
+ 		}
+ 
+ 		AppendInst(psState, psCodeBlock, psInst);
+@@ -2885,10 +2904,10 @@ IMG_VOID ConvertComparisonInstructionF32(PINTERMEDIATE_STATE psState, PCODEBLOCK
+ 
+ 			psMoveInst = AllocateInst(psState, IMG_NULL);
+ 			SetOpcode(psState, psMoveInst, IMOV);
+-			GetDestinationF32(psState, psCodeBlock, &psSrc->sDest, i, &psMoveInst->asDest[0]);
++			pfnGetDest(psState, psCodeBlock, &psSrc->sDest, i, &psMoveInst->asDest[0]);
+ 			if (puRepDest[i] != UINT_MAX)
+ 			{
+-				GetDestinationF32(psState, psCodeBlock, &psSrc->sDest, puRepDest[i], &psMoveInst->asArg[0]);
++				pfnGetDest(psState, psCodeBlock, &psSrc->sDest, puRepDest[i], &psMoveInst->asArg[0]);
+ 			}
+ 			else
+ 			{

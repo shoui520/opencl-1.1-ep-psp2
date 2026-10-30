@@ -1,0 +1,44 @@
+USP: set NOSCHED in the right bit of IMA32 and XOR/ROL/ASR
+
+HWInstSetNoSched had no case for IMA32, XOR, ROL or ASR, so it set the
+default EURASIA_USE1_NOSCHED bit, which is part of another field in those
+encodings, and HWInstSupportsSyncStart allowed SYNCSTART on IMA32, which has
+no such bit.  Use the integer and bitwise NOSCHED bits and don't put
+SYNCSTART on IMA32.
+
+diff --git a/tools/intern/usp/hwinst.c b/tools/intern/usp/hwinst.c
+index 6a2dae0..f003224 100644
+--- a/tools/intern/usp/hwinst.c
++++ b/tools/intern/usp/hwinst.c
+@@ -9560,6 +9560,9 @@ IMG_INTERNAL IMG_BOOL HWInstSetNoSched(USP_OPCODE	eOpcode,
+ 		case USP_OPCODE_FIRV:
+ 		case USP_OPCODE_FIRH:
+ 		case USP_OPCODE_FPMA:
++		#if defined(SGX_FEATURE_USE_32BIT_INT_MAD)
++		case USP_OPCODE_IMA32:
++		#endif /* defined(SGX_FEATURE_USE_32BIT_INT_MAD) */
+ 		{
+ 			if	(bNoSchedState)
+ 			{
+@@ -9620,8 +9623,11 @@ IMG_INTERNAL IMG_BOOL HWInstSetNoSched(USP_OPCODE	eOpcode,
+ 
+ 		case USP_OPCODE_AND:
+ 		case USP_OPCODE_OR:
++		case USP_OPCODE_XOR:
+ 		case USP_OPCODE_SHL:
+ 		case USP_OPCODE_SHR:
++		case USP_OPCODE_ROL:
++		case USP_OPCODE_ASR:
+ 		case USP_OPCODE_RLP:
+ 		{
+ 			if	(bNoSchedState)
+@@ -9879,6 +9885,9 @@ IMG_INTERNAL IMG_BOOL HWInstSupportsSyncStart(USP_OPCODE eOpcode)
+ 		case USP_OPCODE_SETFC:
+ 		case USP_OPCODE_PREAMBLE:
+ 		case USP_OPCODE_LIMM:
++		#if defined(SGX_FEATURE_USE_32BIT_INT_MAD)
++		case USP_OPCODE_IMA32:
++		#endif /* defined(SGX_FEATURE_USE_32BIT_INT_MAD) */
+ 		#if defined(SGX_FEATURE_USE_VEC34)
+ 		case USP_OPCODE_VDP3:
+ 		case USP_OPCODE_VDP4:

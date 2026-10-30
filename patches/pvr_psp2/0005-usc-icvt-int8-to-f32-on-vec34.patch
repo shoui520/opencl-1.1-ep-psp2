@@ -1,0 +1,56 @@
+USC: convert 8-bit integers to F32 on vector cores
+
+ConvertReformatInstructionF16F32_Vec aborted (icvt_f16_vec.c:3213) on
+reformats from I8_UN/U8_UN, e.g. OpenCL (float)uchar.  Handle them in
+ConvertInteger16ToF32_Vec with the 8-bit unpacks (IVPCKFLTS8/IVPCKFLTU8).
+
+diff --git a/tools/intern/usc2/icvt_f16_vec.c b/tools/intern/usc2/icvt_f16_vec.c
+index 558ce99..d875812 100644
+--- a/tools/intern/usc2/icvt_f16_vec.c
++++ b/tools/intern/usc2/icvt_f16_vec.c
+@@ -2939,8 +2939,8 @@ IMG_VOID ConvertInteger16ToF32_Vec(PINTERMEDIATE_STATE	psState,
+ /*****************************************************************************
+  FUNCTION	: ConvertInteger16ToF32_Vec
+     
+- PURPOSE	: Convert an input instruction converting from U16/I16 to F16/F32
+-			  to the intermediate format.
++ PURPOSE	: Convert an input instruction converting from U16/I16/U8/I8 to
++			  F16/F32 to the intermediate format.
+ 
+  PARAMETERS	: psState 		- Compiler state.
+ 			  psCodeBlock	- Block for any extra instructions.
+@@ -2999,14 +2999,17 @@ IMG_VOID ConvertInteger16ToF32_Vec(PINTERMEDIATE_STATE	psState,
+ 			Create an instruction to convert the source register to F16/F32.
+ 		*/
+ 		psPackInst = AllocateInst(psState, IMG_NULL);
+-		if (eSrcFormat == UF_REGFORMAT_I16)
+-		{
+-			SetOpcode(psState, psPackInst, IVPCKFLTS16);
+-		}
+-		else
++		switch (eSrcFormat)
+ 		{
+-			ASSERT(eSrcFormat == UF_REGFORMAT_U16);
+-			SetOpcode(psState, psPackInst, IVPCKFLTU16);
++			case UF_REGFORMAT_I16: SetOpcode(psState, psPackInst, IVPCKFLTS16); break;
++			case UF_REGFORMAT_U16: SetOpcode(psState, psPackInst, IVPCKFLTU16); break;
++			case UF_REGFORMAT_I8_UN: SetOpcode(psState, psPackInst, IVPCKFLTS8); break;
++			default:
++			{
++				ASSERT(eSrcFormat == UF_REGFORMAT_U8_UN);
++				SetOpcode(psState, psPackInst, IVPCKFLTU8);
++				break;
++			}
+ 		}
+ 		psPackInst->asDest[0] = sDest;
+ 		psPackInst->auDestMask[0] = 1 << uChan;
+@@ -3192,7 +3195,8 @@ IMG_VOID ConvertReformatInstructionF16F32_Vec(PINTERMEDIATE_STATE	psState,
+ 		ConvertInteger32ToF32_Vec(psState, psCodeBlock, psInputInst, bF16, eSrcFormat);
+ 		return;
+ 	}
+-	if (eSrcFormat == UF_REGFORMAT_I16 || eSrcFormat == UF_REGFORMAT_U16)
++	if (eSrcFormat == UF_REGFORMAT_I16 || eSrcFormat == UF_REGFORMAT_U16 ||
++		eSrcFormat == UF_REGFORMAT_I8_UN || eSrcFormat == UF_REGFORMAT_U8_UN)
+ 	{
+ 		ConvertInteger16ToF32_Vec(psState, psCodeBlock, psInputInst, bF16, eSrcFormat);
+ 		return;

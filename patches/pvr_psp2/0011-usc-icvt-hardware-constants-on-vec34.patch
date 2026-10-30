@@ -1,0 +1,160 @@
+USC: use the target's numbering for hardware constants in integer code
+
+The 32-bit integer conversions used EURASIA_USE_SPECIAL_CONSTANT_INT32ONE,
+_ZERO and _FLOAT1OVER65536 directly.  Cores with the vector instruction set
+number the constants differently (the intermediate numbering is twice the
+vector one), so these sources read other constants: mul_hi, the sign
+extensions, comparisons of 64-bit values and float to unsigned clamps gave
+wrong results.  Look the values up with FindHardwareConstant and fall back
+to an immediate.
+
+diff --git a/tools/intern/usc2/icvt_i32.c b/tools/intern/usc2/icvt_i32.c
+index 5613bb6..0a24ac4 100644
+--- a/tools/intern/usc2/icvt_i32.c
++++ b/tools/intern/usc2/icvt_i32.c
+@@ -25,6 +25,39 @@
+ #include "bitops.h"
+ #include <limits.h>
+ 
++static IMG_VOID GetConstantSource(PINTERMEDIATE_STATE	psState,
++								  IMG_UINT32			uValue,
++								  IMG_PUINT32			puType,
++								  IMG_PUINT32			puNumber)
++/*****************************************************************************
++ FUNCTION	: GetConstantSource
++
++ PURPOSE	: Get a source argument with a constant value: the hardware constant
++			  in the target's numbering (cores with the vector instruction set
++			  number them differently from the EURASIA_USE_SPECIAL_CONSTANT_xxx
++			  values) or, if there isn't one, an immediate.
++
++ PARAMETERS	: psState			- Compiler state.
++			  uValue			- Value of the source.
++			  puType, puNumber	- Returns the argument.
++
++ RETURNS	: Nothing.
++*****************************************************************************/
++{
++	IMG_UINT32	uConst = FindHardwareConstant(psState, uValue);
++
++	if (uConst != USC_UNDEF)
++	{
++		*puType = USEASM_REGTYPE_FPCONSTANT;
++		*puNumber = uConst;
++	}
++	else
++	{
++		*puType = USEASM_REGTYPE_IMMEDIATE;
++		*puNumber = uValue;
++	}
++}
++
+ IMG_INTERNAL
+ IMG_VOID IntegerAbsolute(PINTERMEDIATE_STATE	psState,
+ 						 PCODEBLOCK				psBlock,
+@@ -921,10 +954,8 @@ IMG_VOID Generate32bitIntegerMulNonNeg_Non545(PINTERMEDIATE_STATE	psState,
+ 				psInst->u.psMovc->eTest = TEST_TYPE_LT_ZERO;
+ 				SetDest(psState, psInst, 0 /* uDestIdx */, USEASM_REGTYPE_TEMP, uSignBit, UF_REGFORMAT_F32);
+ 				SetSrcFromArg(psState, psInst, 0 /* uSrcIdx */, psSignBit);
+-				psInst->asArg[1].uType = USEASM_REGTYPE_FPCONSTANT;
+-				psInst->asArg[1].uNumber = EURASIA_USE_SPECIAL_CONSTANT_INT32ONE;
+-				psInst->asArg[2].uType = USEASM_REGTYPE_FPCONSTANT;
+-				psInst->asArg[2].uNumber = EURASIA_USE_SPECIAL_CONSTANT_ZERO;
++				GetConstantSource(psState, 0xFFFFFFFF, &psInst->asArg[1].uType, &psInst->asArg[1].uNumber);
++				GetConstantSource(psState, 0, &psInst->asArg[2].uType, &psInst->asArg[2].uNumber);
+ 				InsertInstBefore(psState, psBlock, psInst, psInsertBeforeInst);
+ 
+ 				/*
+@@ -1421,10 +1452,8 @@ IMG_VOID Generate32bitIntegerAdd_Non545(PINTERMEDIATE_STATE		psState,
+ 			SetPredicate(psState, psInst, uPredSrc, bPredNegate);
+ 
+ 			SetSrc(psState, psInst, 0 /* uSrcIdx */, USEASM_REGTYPE_TEMP, uTemp4, UF_REGFORMAT_F32);
+-			psInst->asArg[1].uType = USEASM_REGTYPE_FPCONSTANT;
+-			psInst->asArg[1].uNumber = EURASIA_USE_SPECIAL_CONSTANT_ZERO;
+-			psInst->asArg[2].uType = USEASM_REGTYPE_FPCONSTANT;
+-			psInst->asArg[2].uNumber = EURASIA_USE_SPECIAL_CONSTANT_INT32ONE;
++			GetConstantSource(psState, 0, &psInst->asArg[1].uType, &psInst->asArg[1].uNumber);
++			GetConstantSource(psState, 0xFFFFFFFF, &psInst->asArg[2].uType, &psInst->asArg[2].uNumber);
+ 			InsertInstBefore(psState, psBlock, psInst, psInsertBeforeInst);
+ 		}
+ 		else
+@@ -3342,8 +3371,7 @@ IMG_VOID ExpandFTRCInstruction(PINTERMEDIATE_STATE		psState,
+ 
+ 	SetDest(psState, psFrcInst, 0 /* uDestIdx */, USEASM_REGTYPE_TEMP, uNegFlrTempNum, UF_REGFORMAT_F32);
+ 
+-	psFrcInst->asArg[0].uType = USEASM_REGTYPE_FPCONSTANT;
+-	psFrcInst->asArg[0].uNumber = EURASIA_USE_SPECIAL_CONSTANT_ZERO;
++	GetConstantSource(psState, 0, &psFrcInst->asArg[0].uType, &psFrcInst->asArg[0].uNumber);
+ 
+ 	CopySrc(psState, psFrcInst, 1 /* uCopyToArgIdx */, psInst, 0 /* uCopyFromArgIdx */);
+ 	psFrcInst->u.psFloat->asSrcMod[0] = *psArgMod;
+@@ -3610,8 +3638,7 @@ IMG_VOID ExpandCVTFLT2INTInstruction(PINTERMEDIATE_STATE	psState,
+ 
+ 		if (!bSigned)
+ 		{
+-			psMaxInst->asArg[1].uType = USEASM_REGTYPE_FPCONSTANT;
+-			psMaxInst->asArg[1].uNumber = EURASIA_USE_SPECIAL_CONSTANT_ZERO;
++			GetConstantSource(psState, 0, &psMaxInst->asArg[1].uType, &psMaxInst->asArg[1].uNumber);
+ 		}
+ 		else
+ 		{
+@@ -3662,8 +3689,7 @@ IMG_VOID ExpandCVTFLT2INTInstruction(PINTERMEDIATE_STATE	psState,
+ 		SetOpcode(psState, psMulInst, IFMUL);
+ 		SetDest(psState, psMulInst, 0 /* uDestIdx */, USEASM_REGTYPE_TEMP, uScaledTemp, UF_REGFORMAT_F32);
+ 		SetSrc(psState, psMulInst, 0 /* uSrcIdx */, USEASM_REGTYPE_TEMP, uClampMinTemp, UF_REGFORMAT_F32);
+-		psMulInst->asArg[1].uType = USEASM_REGTYPE_FPCONSTANT;
+-		psMulInst->asArg[1].uNumber = EURASIA_USE_SPECIAL_CONSTANT_FLOAT1OVER65536;
++		GetConstantSource(psState, 0x37800000, &psMulInst->asArg[1].uType, &psMulInst->asArg[1].uNumber);
+ 		InsertInstBefore(psState, psInst->psBlock, psMulInst, psInst);
+ 	}
+ 	
+@@ -3777,8 +3803,7 @@ IMG_VOID ExpandCVTFLT2INTInstruction(PINTERMEDIATE_STATE	psState,
+ 		SetSrc(psState, psMovcInst, 0 /* uSrcIdx */, USEASM_REGTYPE_TEMP, uClampMaxPredTemp, UF_REGFORMAT_F32);
+ 		if (!bSigned)
+ 		{
+-			psMovcInst->asArg[1].uType = USEASM_REGTYPE_FPCONSTANT;
+-			psMovcInst->asArg[1].uNumber = EURASIA_USE_SPECIAL_CONSTANT_INT32ONE;
++			GetConstantSource(psState, 0xFFFFFFFF, &psMovcInst->asArg[1].uType, &psMovcInst->asArg[1].uNumber);
+ 		}
+ 		else
+ 		{
+@@ -4179,6 +4204,7 @@ IMG_VOID CreateComparisonInt32(PINTERMEDIATE_STATE	psState,
+ 		IMG_UINT32	uTemp = GetNextRegister(psState);
+ 		ARG			sTemp;
+ 		IMG_BOOL	bNonZero;
++		IMG_UINT32	uOnesType, uOnesNum, uZeroType, uZeroNum;
+ 
+ 		ASSERT(uCompOp == UFREG_COMPOP_GT || uCompOp == UFREG_COMPOP_LE);
+ 
+@@ -4215,14 +4241,16 @@ IMG_VOID CreateComparisonInt32(PINTERMEDIATE_STATE	psState,
+ 		/*
+ 			Set TEMP = (RESULT_LOW != 0) ? 0xFFFFFFFF : 0
+ 		*/
++		GetConstantSource(psState, 0xFFFFFFFF, &uOnesType, &uOnesNum);
++		GetConstantSource(psState, 0, &uZeroType, &uZeroNum);
+ 		GenerateIntMovc(psState, 
+ 						psCodeBlock, 
+ 						uTemp, 
+ 						&sComparisonResultLow, 
+-						USEASM_REGTYPE_FPCONSTANT, 
+-						EURASIA_USE_SPECIAL_CONSTANT_INT32ONE, 
+-						USEASM_REGTYPE_FPCONSTANT, 
+-						EURASIA_USE_SPECIAL_CONSTANT_ZERO);
++						uOnesType, 
++						uOnesNum, 
++						uZeroType, 
++						uZeroNum);
+ 
+ 		/*
+ 			Set TEMP = (RESULT_HIGH != 0) ? 0 : TEMP
+@@ -4231,8 +4259,8 @@ IMG_VOID CreateComparisonInt32(PINTERMEDIATE_STATE	psState,
+ 						psCodeBlock, 
+ 						uTemp, 
+ 						&sComparisonResultHigh, 
+-						USEASM_REGTYPE_FPCONSTANT, 
+-						EURASIA_USE_SPECIAL_CONSTANT_ZERO, 
++						uZeroType, 
++						uZeroNum, 
+ 						USEASM_REGTYPE_TEMP, 
+ 						uTemp);
+ 

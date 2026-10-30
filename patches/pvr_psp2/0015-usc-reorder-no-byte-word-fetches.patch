@@ -1,0 +1,27 @@
+USC: don't combine byte or word loads into fetches
+
+On SGX543 an LDAB or LDAW with the FETCH flag writes only its first
+destination, so four char loads combined into one fetch returned one byte
+and left the rest unset.  The IMG compiler never makes such a fetch.  Only
+combine dword loads.
+
+diff --git a/tools/intern/usc2/reorder.c b/tools/intern/usc2/reorder.c
+index b35a78b..250dadd 100644
+--- a/tools/intern/usc2/reorder.c
++++ b/tools/intern/usc2/reorder.c
+@@ -244,6 +244,15 @@ IMG_VOID BuildFetchInstructions(PINTERMEDIATE_STATE psState)
+ 
+ 		uPrimSize = psBaseInst->u.psLoadMemConst->uDataSize;
+ 
++		/*
++			A byte or word load with FETCH on SGX543 writes only its first
++			destination (tested on hardware; the IMG compiler never makes one).
++		*/
++		if (uPrimSize < LONG_SIZE)
++		{
++			continue;
++		}
++
+ 		uLastStaticOffset = GetFetchStaticOffset(psBaseInst);
+ 
+ 		uFetchCount = 1;

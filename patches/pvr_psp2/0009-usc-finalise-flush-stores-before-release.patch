@@ -1,0 +1,42 @@
+USC: complete stores before releasing a mutex
+
+The OpenCL data fence insertion in InsertWaitsBP only fenced stores before
+dependent loads and at the end of a block, so an atomic's STAD could still be
+in flight at RELEASE and the next instance to take the lock would load the
+old value.  Insert IDF and WDF before a RELEASE that follows a store.
+
+diff --git a/tools/intern/usc2/finalise.c b/tools/intern/usc2/finalise.c
+index b8a18a1..041aac9 100644
+--- a/tools/intern/usc2/finalise.c
++++ b/tools/intern/usc2/finalise.c
+@@ -4180,7 +4180,29 @@ static IMG_VOID InsertWaitsBP(PINTERMEDIATE_STATE psState, PCODEBLOCK psBlock, I
+ 			 psInst != NULL;
+ 			 psInst = psInst->psNext, ++uInst)
+ 		{
+-			if ((g_psInstDesc[psInst->eOpcode].uFlags2 & DESC_FLAGS2_ABSOLUTELOADSTORE) != 0)
++			if (psInst->eOpcode == IRELEASE && sStores.psHead != NULL)
++			{
++				PINST	psIDFInst;
++
++				/*
++					Stores made while holding a mutex must be complete before it is
++					released or another instance could load the old value.
++				*/
++				psIDFInst = InsertIDF(psState, psBlock, psInst->psPrev);
++				InsertWait(psState, &sCtx, psBlock, 0, psInst);
++				ASSERT(psIDFInst->psNext->psNext == psInst);
++
++				psEntry = sStores.psHead;
++				while (psEntry != NULL)
++				{
++					PUSC_LIST_ENTRY psNext = psEntry->psNext;
++					PSTORE_DATA psStoreData = IMG_CONTAINING_RECORD(psEntry, PSTORE_DATA, sListEntry);
++					UscFree(psState, psStoreData);
++					psEntry = psNext;
++				}
++				InitializeList(&sStores);
++			}
++			else if ((g_psInstDesc[psInst->eOpcode].uFlags2 & DESC_FLAGS2_ABSOLUTELOADSTORE) != 0)
+ 			{
+ 				if (g_psInstDesc[psInst->eOpcode].uFlags & DESC_FLAGS_MEMSTORE)
+ 				{

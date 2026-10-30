@@ -1,0 +1,114 @@
+USC: generate the memory access for atomics on SGX543/544
+
+GenerateIntegerArithmetic only loaded the old value and stored the new one
+for ATOM_INC/DEC/ADD in its generic path.  On cores with IMA32 32x16+32
+(SGX543/544) it went to GenerateIntegerArithmetic_543, which knows nothing of
+atomics, so between LOCK and RELEASE there was just an IMA32 of undefined
+registers and no memory access at all.  Do the atomic load, argument swap and
+store around every core's arithmetic, with the operation as an ADD.
+
+diff --git a/tools/intern/usc2/icvt_i32.c b/tools/intern/usc2/icvt_i32.c
+index f02c5a7..e7dac2f 100644
+--- a/tools/intern/usc2/icvt_i32.c
++++ b/tools/intern/usc2/icvt_i32.c
+@@ -2383,6 +2383,47 @@ IMG_VOID GenerateIntegerArithmetic(PINTERMEDIATE_STATE		psState,
+ 	 from memory, rather than the result of the associated computation. */
+ 	ARG sAtomicNew, sAddress;
+ 	IMG_BOOL bDoStore = IMG_FALSE;
++
++	switch (eOpcode)
++	{
++		case UFOP_ATOM_INC:
++		case UFOP_ATOM_DEC:
++		{
++			/* No modifiers for second operand */
++			bNegateB = IMG_FALSE;
++			/* Second argument for atomic inc/dec is an immediate */
++			InitInstArg(psArgB);
++			psArgB->uType = USEASM_REGTYPE_IMMEDIATE;
++			psArgB->uNumber = (IMG_UINT)((eOpcode == UFOP_ATOM_INC) ? 1 : -1);
++		}
++		case UFOP_ATOM_ADD:
++		{
++			/* Generate a temporary register */
++			InitInstArg(&sAtomicNew);
++			sAtomicNew.uType = USEASM_REGTYPE_TEMP;
++			sAtomicNew.uNumber = GetNextRegister(psState);
++			sAtomicNew.eFmt = psDestLow->eFmt;
++			/* Remember to store the old result later */
++			sAddress = *psArgA;
++			bDoStore = IMG_TRUE;
++			/* All atomics have to memload the first argument */
++			GenerateAtomicLoad(psState, psBlock, &sAddress, psDestLow);
++			/* Flip ArgA with value loaded from memory so that
++			 common functions work as they should */
++			*psArgA = *psDestLow;
++			bNegateA = IMG_FALSE;
++			/* Replace the return register which we will store later */
++			*psDestLow = sAtomicNew;
++			/* The rest is an ordinary addition on every core */
++			eOpcode = UFOP_ADD;
++			break;
++		}
++		default:
++		{
++			break;
++		}
++	}
++
+ 	#if defined(SUPPORT_SGX545)
+ 	if (
+ 		 (psState->psTargetFeatures->ui32Flags & SGX_FEATURE_FLAGS_USE_32BIT_INT_MAD) && 
+@@ -2435,34 +2476,6 @@ IMG_VOID GenerateIntegerArithmetic(PINTERMEDIATE_STATE		psState,
+ 	{
+ 		switch (eOpcode)
+ 		{
+-			case UFOP_ATOM_INC:
+-			case UFOP_ATOM_DEC:
+-			{
+-				/* No modifiers for second operand */
+-				bNegateB = IMG_FALSE;
+-				/* Second argument for atomic inc/dec is an immediate */
+-				InitInstArg(psArgB);
+-				psArgB->uType = USEASM_REGTYPE_IMMEDIATE;
+-				psArgB->uNumber = (IMG_UINT)((eOpcode == UFOP_ATOM_INC) ? 1 : -1);
+-			}
+-			case UFOP_ATOM_ADD:
+-			{
+-				/* Generate a temporary register */
+-				InitInstArg(&sAtomicNew);
+-				sAtomicNew.uType = USEASM_REGTYPE_TEMP;
+-				sAtomicNew.uNumber = GetNextRegister(psState);
+-				sAtomicNew.eFmt = psDestLow->eFmt;
+-				/* Remember to store the old result later */
+-				sAddress = *psArgA;
+-				bDoStore = IMG_TRUE;
+-				/* All atomics have to memload the first argument */
+-				GenerateAtomicLoad(psState, psBlock, &sAddress, psDestLow);
+-				/* Flip ArgA with value loaded from memory so that
+-				 common functions work as they should */
+-				*psArgA = *psDestLow;
+-				/* Replace the return register which we will store later */
+-				*psDestLow = sAtomicNew;
+-			}
+ 			case UFOP_ADD:
+ 			case UFOP_ADD2:
+ 			{
+@@ -2521,12 +2534,12 @@ IMG_VOID GenerateIntegerArithmetic(PINTERMEDIATE_STATE		psState,
+ 			    break;
+ 			}
+ 		}
++	}
+ 
+-		if (bDoStore)
+-		{
+-			/* End of an atomic operation, store the new value */
+-			GenerateAtomicStore(psState, psBlock, &sAddress, psDestLow);
+-		}
++	if (bDoStore)
++	{
++		/* End of an atomic operation, store the new value */
++		GenerateAtomicStore(psState, psBlock, &sAddress, psDestLow);
+ 	}
+ }
+ 

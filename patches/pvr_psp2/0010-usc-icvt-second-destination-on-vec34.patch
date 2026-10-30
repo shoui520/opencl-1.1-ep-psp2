@@ -1,0 +1,250 @@
+USC: give an integer instruction's second destination its own temporaries
+
+On cores with the vector instruction set an integer instruction's results
+go to the scalar temporaries USC_TEMPREG_VECTEMPDEST+chan and are then moved
+into the vector destination.  Both destinations of a two-destination
+instruction (MUL2 and MAD2's high and low words, ADD2's carry) used the
+same temporaries, so the second result overwrote the first, and sDest2 was
+also read for instructions that have only one destination.  Use
+USC_TEMPREG_VECTEMPDEST2 for the second destination and only store it when
+the instruction has one.
+
+diff --git a/tools/intern/usc2/icvt_f16_vec.c b/tools/intern/usc2/icvt_f16_vec.c
+index d875812..eb47d78 100644
+--- a/tools/intern/usc2/icvt_f16_vec.c
++++ b/tools/intern/usc2/icvt_f16_vec.c
+@@ -2378,7 +2378,8 @@ IMG_VOID StoreIntoVectorDest(PINTERMEDIATE_STATE	psState,
+ /*****************************************************************************
+  FUNCTION	: StoreIntoVectorDest
+     
+- PURPOSE	: 
++ PURPOSE	: Move the scalar results of an instruction's first destination
++			  into its vector register.
+ 
+  PARAMETERS	: psState			- Compiler state.
+ 			  psCodeBlock		- Block to add the intermediate instructions to.
+@@ -2387,16 +2388,41 @@ IMG_VOID StoreIntoVectorDest(PINTERMEDIATE_STATE	psState,
+ 			  
+  RETURNS	: None.
+ *****************************************************************************/
++{
++	StoreIntoVectorDestIdx(psState, psCodeBlock, psInputInst, psInputDest, 0 /* uDestIdx */);
++}
++
++IMG_INTERNAL
++IMG_VOID StoreIntoVectorDestIdx(PINTERMEDIATE_STATE	psState,
++								PCODEBLOCK			psCodeBlock,
++								PUNIFLEX_INST		psInputInst,
++								PUF_REGISTER		psInputDest,
++								IMG_UINT32			uDestIdx)
++/*****************************************************************************
++ FUNCTION	: StoreIntoVectorDestIdx
++    
++ PURPOSE	: Move the scalar results of either destination of an instruction
++			  (see GetDestinationTypelessIdx) into its vector register.
++
++ PARAMETERS	: psState			- Compiler state.
++			  psCodeBlock		- Block to add the intermediate instructions to.
++			  psInputInst		- Input instruction to store for.
++			  psInputDest		- Input destination to store into.
++			  uDestIdx			- 0 for the first destination, 1 for the second.
++			  
++ RETURNS	: None.
++*****************************************************************************/
+ {
+ 	PINST		psMkVecInst;
+ 	IMG_UINT32	uChan;
++	IMG_UINT32	uScalarBase = uDestIdx == 0 ? USC_TEMPREG_VECTEMPDEST : USC_TEMPREG_VECTEMPDEST2;
+ 
+ 	psMkVecInst = AllocateInst(psState, NULL);
+ 
+ 	SetOpcode(psState, psMkVecInst, IVMOV);
+ 
+-	GetDestinationF32_Vec(psState, &psInputInst->sDest, &psMkVecInst->asDest[0]);
+-	psMkVecInst->auDestMask[0] = psInputInst->sDest.u.byMask;
++	GetDestinationF32_Vec(psState, psInputDest, &psMkVecInst->asDest[0]);
++	psMkVecInst->auDestMask[0] = psInputDest->u.byMask;
+ 
+ 	GetVectorPredicateInst(psState, psMkVecInst, psInputInst);
+ 
+@@ -2405,7 +2431,7 @@ IMG_VOID StoreIntoVectorDest(PINTERMEDIATE_STATE	psState,
+ 	for (uChan = 0; uChan < 4; uChan++)
+ 	{
+ 		psMkVecInst->asArg[1 + uChan].uType = USEASM_REGTYPE_TEMP;
+-		psMkVecInst->asArg[1 + uChan].uNumber = USC_TEMPREG_VECTEMPDEST + uChan;
++		psMkVecInst->asArg[1 + uChan].uNumber = uScalarBase + uChan;
+ 	}
+ 
+ 	psMkVecInst->u.psVec->auSwizzle[0] = USEASM_SWIZZLE(X, Y, Z, W);
+diff --git a/tools/intern/usc2/icvt_i32.c b/tools/intern/usc2/icvt_i32.c
+index d8e4f18..5613bb6 100644
+--- a/tools/intern/usc2/icvt_i32.c
++++ b/tools/intern/usc2/icvt_i32.c
+@@ -157,6 +157,33 @@ IMG_VOID GetDestinationTypeless(PINTERMEDIATE_STATE psState,
+ 			  
+  RETURNS	: None.
+ *****************************************************************************/
++{
++	GetDestinationTypelessIdx(psState, psCodeBlock, psDest, uChan, 0 /* uDestIdx */, psHwSource);
++}
++
++IMG_VOID GetDestinationTypelessIdx(PINTERMEDIATE_STATE psState, 
++								   PCODEBLOCK psCodeBlock, 
++								   PUF_REGISTER psDest, 
++								   IMG_UINT32 uChan, 
++								   IMG_UINT32 uDestIdx,
++								   PARG psHwSource)
++/*****************************************************************************
++ FUNCTION	: GetDestinationTypelessIdx
++    
++ PURPOSE	: GetDestinationTypeless for either destination of an instruction
++			  with two: on cores with the vector instruction set each
++			  destination has its own scalar temporaries.
++
++ PARAMETERS	: psState		- Compiler state.
++			  psCodeBlock	- Block to insert any extra instructions needed
++							to update the input destination.
++			  psDest		- Input destination.
++			  uChan			- Channel to write.
++			  uDestIdx		- 0 for the first destination, 1 for the second.
++			  psHwSource	- Returns the intermediate register to write to.
++			  
++ RETURNS	: None.
++*****************************************************************************/
+ {
+ 	#if defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554)
+ 	if (psState->psTargetFeatures->ui32Flags & SGX_FEATURE_FLAGS_USE_VEC34)
+@@ -167,11 +194,12 @@ IMG_VOID GetDestinationTypeless(PINTERMEDIATE_STATE psState,
+ 		*/
+ 		InitInstArg(psHwSource);
+ 		psHwSource->uType = USEASM_REGTYPE_TEMP;
+-		psHwSource->uNumber = USC_TEMPREG_VECTEMPDEST + uChan;
++		psHwSource->uNumber = (uDestIdx == 0 ? USC_TEMPREG_VECTEMPDEST : USC_TEMPREG_VECTEMPDEST2) + uChan;
+ 	}
+ 	else
+ 	#endif /* defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554) */
+ 	{
++		PVR_UNREFERENCED_PARAMETER(uDestIdx);
+ 		GetDestinationF32(psState, psCodeBlock, psDest, uChan, psHwSource);
+ 	}
+ }
+@@ -4468,7 +4496,8 @@ IMG_VOID MoveTempToDestination(PINTERMEDIATE_STATE		psState,
+ 							   IMG_UINT32				uPredicate,
+ 							   IMG_UINT32				uChan,
+ 							   IMG_UINT32				uRepChan,
+-							   IMG_UINT32				uTempDestNum)
++							   IMG_UINT32				uTempDestNum,
++							   IMG_UINT32				uDestIdx)
+ /*****************************************************************************
+  FUNCTION	: MoveTempToDestination
+ 
+@@ -4484,6 +4513,7 @@ IMG_VOID MoveTempToDestination(PINTERMEDIATE_STATE		psState,
+ 			  uTempDestNum			- Number of temporary register that the
+ 									main instruction wrote its result to for
+ 									this channel.
++			  uDestIdx				- Which destination of the instruction psDest is.
+ 
+  RETURNS	: None
+ *****************************************************************************/
+@@ -4492,14 +4522,14 @@ IMG_VOID MoveTempToDestination(PINTERMEDIATE_STATE		psState,
+ 	
+ 	psMoveInst = AllocateInst(psState, IMG_NULL);
+ 	SetOpcode(psState, psMoveInst, IMOV);
+-	GetDestinationTypeless(psState, psBlock, psDest, uChan, &psMoveInst->asDest[0]);
++	GetDestinationTypelessIdx(psState, psBlock, psDest, uChan, uDestIdx, &psMoveInst->asDest[0]);
+ 	if (uRepChan != UINT_MAX)
+ 	{
+ 		/*
+ 			Copying FROM the destination of an earlier instruction
+ 			(GetDestination used to fill out the SOURCE of this move...)
+ 		*/
+-		GetDestinationTypeless(psState, psBlock, psDest, uRepChan, &psMoveInst->asArg[0]);
++		GetDestinationTypelessIdx(psState, psBlock, psDest, uRepChan, uDestIdx, &psMoveInst->asArg[0]);
+ 	}
+ 	else
+ 	{
+@@ -6517,7 +6547,7 @@ PCODEBLOCK ConvertIntegerInstruction(PINTERMEDIATE_STATE psState, PCODEBLOCK psB
+ 					/*
+ 						Convert the destination for this channel to the intermediate format.
+ 					*/
+-					GetDestinationTypeless(psState, psBlock, psInputDest, uChan, psHwDest);
++					GetDestinationTypelessIdx(psState, psBlock, psInputDest, uChan, uDestIdx, psHwDest);
+ 				}	
+ 
+ 				apsDest[uDestIdx] = psHwDest;
+@@ -6917,9 +6947,10 @@ PCODEBLOCK ConvertIntegerInstruction(PINTERMEDIATE_STATE psState, PCODEBLOCK psB
+ 									  psSrc->uPredicate,
+ 									  uChan,
+ 									  puRepDest[uChan],
+-									  aauTempDestNum[0][uChan]);
++									  aauTempDestNum[0][uChan],
++									  0 /* uDestIdx */);
+ 			}
+-			if (psSrc->sDest2.u.byMask & (1U << uChan))
++			if (uDest2Mask & (1U << uChan))
+ 			{
+ 				MoveTempToDestination(psState,
+ 									  psBlock,
+@@ -6927,7 +6958,8 @@ PCODEBLOCK ConvertIntegerInstruction(PINTERMEDIATE_STATE psState, PCODEBLOCK psB
+ 									  psSrc->uPredicate,
+ 									  uChan,
+ 									  puRepDest[uChan],
+-									  aauTempDestNum[1][uChan]);
++									  aauTempDestNum[1][uChan],
++									  1 /* uDestIdx */);
+ 			}
+ 		}
+ 	}
+@@ -6945,9 +6977,10 @@ PCODEBLOCK ConvertIntegerInstruction(PINTERMEDIATE_STATE psState, PCODEBLOCK psB
+ 		{
+ 			StoreIntoVectorDest(psState, psBlock, psSrc, &psSrc->sDest);
+ 		}
+-		if (psSrc->sDest2.u.byMask != 0)
++		/* (sDest2 means nothing for an instruction with one destination) */
++		if (uDest2Mask != 0)
+ 		{
+-			StoreIntoVectorDest(psState, psBlock, psSrc, &psSrc->sDest2);
++			StoreIntoVectorDestIdx(psState, psBlock, psSrc, &psSrc->sDest2, 1 /* uDestIdx */);
+ 		}
+ 	}
+ 	#endif /* defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554) */
+diff --git a/tools/intern/usc2/uscshrd.h b/tools/intern/usc2/uscshrd.h
+index 7623816..b4121ac 100644
+--- a/tools/intern/usc2/uscshrd.h
++++ b/tools/intern/usc2/uscshrd.h
+@@ -361,7 +361,9 @@ __attribute__ ((noreturn))
+ #define USC_TEMPREG_OUTPUT_BUFF_NUM			(USC_TEMPREG_TEMPDEST2 + 4)
+ #define USC_TEMPREG_OUTPUT_BUFF_IDX			(USC_TEMPREG_OUTPUT_BUFF_NUM + 1)
+ #define USC_TEMPREG_PRIMITIVE_ID			(USC_TEMPREG_OUTPUT_BUFF_IDX + 1)
+-#define USC_TEMPREG_MAXIMUM					(USC_TEMPREG_PRIMITIVE_ID + 1)
++/* Scalar results of an integer instruction's second destination on vec34 cores. */
++#define USC_TEMPREG_VECTEMPDEST2			(USC_TEMPREG_PRIMITIVE_ID + 1)
++#define USC_TEMPREG_MAXIMUM					(USC_TEMPREG_VECTEMPDEST2 + 4)
+ 
+ #define USC_PREDREG_TEXKILL					(0)
+ #define USC_PREDREG_TEMP					(1)
+@@ -4331,6 +4333,12 @@ IMG_VOID GetDestinationTypeless(PINTERMEDIATE_STATE psState,
+ 								PUF_REGISTER psDest,
+ 								IMG_UINT32 uChan,
+ 								PARG psHwSource);
++IMG_VOID GetDestinationTypelessIdx(PINTERMEDIATE_STATE psState,
++								   PCODEBLOCK psCodeBlock,
++								   PUF_REGISTER psDest,
++								   IMG_UINT32 uChan,
++								   IMG_UINT32 uDestIdx,
++								   PARG psHwSource);
+ IMG_VOID ZeroExtendInteger(PINTERMEDIATE_STATE	psState,
+ 						   PCODEBLOCK			psCodeBlock,
+ 						   IMG_UINT32			uSrcBitWidth,
+@@ -4833,6 +4841,11 @@ IMG_VOID StoreIntoVectorDest(PINTERMEDIATE_STATE	psState,
+ 							 PCODEBLOCK				psCodeBlock,
+ 							 PUNIFLEX_INST			psInputInst,
+ 							 PUF_REGISTER			psInputDest);
++IMG_VOID StoreIntoVectorDestIdx(PINTERMEDIATE_STATE	psState,
++								PCODEBLOCK			psCodeBlock,
++								PUNIFLEX_INST		psInputInst,
++								PUF_REGISTER		psInputDest,
++								IMG_UINT32			uDestIdx);
+ IMG_VOID TestVecFloat(PINTERMEDIATE_STATE	psState,
+ 					  PCODEBLOCK			psBlock,
+ 					  IMG_UINT32			uTempReg,

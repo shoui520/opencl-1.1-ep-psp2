@@ -1,0 +1,69 @@
+USC: keep every atomic operation's lock and release
+
+MergeIdenticalInstructions treated LOCK, RELEASE and stores as ordinary
+instructions without results, so it merged all but the first lock/release
+pair (and identical stores) away, and it merged an atomic operation's
+synchronised load with an earlier one.  Don't merge them.  With each atomic
+keeping its own lock, the dependency graph must also keep a lock after the
+previous release, or the scheduler nests the sections ("Nested mutex locks
+not allowed").
+
+diff --git a/tools/intern/usc2/dgraph.c b/tools/intern/usc2/dgraph.c
+index dcc0132..60b0ea8 100644
+--- a/tools/intern/usc2/dgraph.c
++++ b/tools/intern/usc2/dgraph.c
+@@ -1791,6 +1791,7 @@ IMG_VOID ComputeMutexLockDependence(PDGRAPH_STATE psDepState)
+ *********************************************************************************/
+ {
+ 	IMG_UINT32 uLockInst = 0;
++	IMG_UINT32 uReleaseInst = USC_UNDEF;
+ 	IMG_BOOL   bLocked = IMG_FALSE;
+ 	IMG_UINT32 uInst = 0;
+ 
+@@ -1819,6 +1820,11 @@ IMG_VOID ComputeMutexLockDependence(PDGRAPH_STATE psDepState)
+ 		/* If we are not in a lock state and this is a lock instruction, set locked */
+ 		if (!bLocked && (psInst->eOpcode == ILOCK))
+ 		{
++			/* Keep the lock after the previous release so the locked sections don't nest */
++			if (uReleaseInst != USC_UNDEF)
++			{
++				AddDependency(psDepState, uReleaseInst, uInst);
++			}
+ 			bLocked = IMG_TRUE;
+ 			uLockInst = uInst;
+ 			continue;
+@@ -1832,6 +1838,7 @@ IMG_VOID ComputeMutexLockDependence(PDGRAPH_STATE psDepState)
+ 		if (bLocked && (psInst->eOpcode == IRELEASE))
+ 		{
+ 			bLocked = IMG_FALSE;
++			uReleaseInst = uInst;
+ 			/* To prevent instruction from being moved outside of the lock, set the release
+ 			 instruction as dependent on every instruction in the lock section */
+ 			for (++uLockInst; uLockInst < uInst; ++uLockInst)
+diff --git a/tools/intern/usc2/iselect.c b/tools/intern/usc2/iselect.c
+index 8b3f0ee..fc67c53 100644
+--- a/tools/intern/usc2/iselect.c
++++ b/tools/intern/usc2/iselect.c
+@@ -10906,6 +10906,22 @@ IMG_BOOL IsUnmergeableInst(PINTERMEDIATE_STATE psState, PINST psInst)
+ 		return IMG_TRUE;
+ 	}
+ 
++	/*
++		Instructions without a result are kept for their side effect: merging would
++		delete all but the first mutex lock/release or identical store. A load
++		synchronised with stores (an atomic operation's) must reread memory.
++	*/
++	if (psInst->eOpcode == ILOCK ||
++		psInst->eOpcode == IRELEASE ||
++		(g_psInstDesc[psInst->eOpcode].uFlags & DESC_FLAGS_MEMSTORE) != 0)
++	{
++		return IMG_TRUE;
++	}
++	if (psInst->eOpcode == ILOADMEMCONST && psInst->u.psLoadMemConst->bSynchronised)
++	{
++		return IMG_TRUE;
++	}
++
+ 	/*
+ 		Don't merge instructions reading/writing intermediate registers which aren't in SSA form. 
+ 	*/

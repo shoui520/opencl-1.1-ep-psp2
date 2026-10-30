@@ -1,0 +1,25 @@
+USC: bypass the cache for modifiable memory on multicore parts
+
+Each core of an SGX543MP has its own cache, so a load can see a stale copy
+of memory another core stored to.  Always bypass the cache for memory that
+the program may modify when there is more than one core.
+
+diff --git a/tools/intern/usc2/inst_usc.c b/tools/intern/usc2/inst_usc.c
+index 37dd546..a971428 100644
+--- a/tools/intern/usc2/inst_usc.c
++++ b/tools/intern/usc2/inst_usc.c
+@@ -15425,6 +15425,14 @@ IMG_BOOL BypassCacheForModifiableShaderMemory(PINTERMEDIATE_STATE psState)
+ 	{
+ 		return IMG_TRUE;
+ 	}
++	/*
++		Each core of a multicore part has its own cache, so a value another
++		core stored can only be seen by bypassing it.
++	*/
++	if (psState->uMPCoreCount > 1)
++	{
++		return IMG_TRUE;
++	}
+ 	return IMG_FALSE;
+ }
+ 

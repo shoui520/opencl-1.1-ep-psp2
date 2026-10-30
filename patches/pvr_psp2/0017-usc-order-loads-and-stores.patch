@@ -1,0 +1,405 @@
+USC: don't merge or reorder loads across stores to the same memory
+
+MergeIdenticalInstructions replaced a load by an identical earlier one even
+when a store in between could have changed the memory, and the dependency
+graph only ordered loads and stores after earlier stores, so a store could
+be moved before an earlier load of the same address.  Reading a value back
+after storing to it (OpenCL local atomics, which the front end lowers to a
+load, an operation and a store, or stores through pointers which may alias)
+gave the old value.  Start a new set of merge candidates for memory loads at
+each store, lock, release or atomic load, and order a store after earlier
+loads it may alias.  The disambiguation also compared the static offsets of
+loads in different units from stores' and only kept the order when the
+store's range was inside the access's; compare byte ranges for overlap.
+
+diff --git a/tools/intern/usc2/dgraph.c b/tools/intern/usc2/dgraph.c
+index 60b0ea8..f06cf2d 100644
+--- a/tools/intern/usc2/dgraph.c
++++ b/tools/intern/usc2/dgraph.c
+@@ -1578,13 +1578,128 @@ static IMG_VOID RecordReadsByArg(PDGRAPH_STATE	psDepState,
+ 	RecordRead(psDepState, uInst, psUserArray, uSourceNum);
+ }
+ 
++typedef struct _MEMACCESS_DATA
++{
++	IMG_UINT32		uInst;
++	PINST			psInst;
++	IMG_BOOL		bAddressRegChanged;
++	USC_LIST_ENTRY	sListEntry;
++} MEMACCESS_DATA, *PMEMACCESS_DATA;
++
++static
++IMG_BOOL GetMemAccessRange(PINST psInst, IMG_PUINT32 puFlags, IMG_PUINT32 puLowest, IMG_PUINT32 puHighest)
++/*********************************************************************************
++ Function			: GetMemAccessRange
++
++ Description		: Get the address space flags of an absolute addressed load or
++					  store and, if it doesn't use a dynamic offset, the range of
++					  bytes it accesses relative to its base address.
++
++ Parameters			: psInst		- Load or store.
++					  puFlags		- Returns the UF_MEM_* flags.
++					  puLowest		- Returns the first byte accessed.
++					  puHighest		- Returns the last byte accessed.
++
++ Return				: TRUE if the range is known.
++*********************************************************************************/
++{
++	IMG_UINT32 uDataSize, uCount, uOffset;
++	PARG psOffset = &psInst->asArg[1];
++
++	if (psInst->eOpcode == ILOADMEMCONST)
++	{
++		PARG psDynOffset = &psInst->asArg[LOADMEMCONST_DYNAMIC_OFFSET_ARGINDEX];
++
++		*puFlags = psInst->u.psLoadMemConst->uFlags;
++		if (psInst->u.psLoadMemConst->bRelativeAddress &&
++			!(psDynOffset->uType == USEASM_REGTYPE_IMMEDIATE && psDynOffset->uNumber == 0))
++		{
++			return IMG_FALSE;
++		}
++		uDataSize = psInst->u.psLoadMemConst->uDataSize;
++		uCount = psInst->u.psLoadMemConst->uFetchCount;
++		/* The static offset is in bytes. */
++		uOffset = psOffset->uNumber;
++	}
++	else
++	{
++		switch (psInst->eOpcode)
++		{
++			case ILDAD: case ISTAD: uDataSize = 4; break;
++			case ILDAW: case ISTAW: uDataSize = 2; break;
++			default: uDataSize = 1; break;
++		}
++		*puFlags = psInst->u.psLdSt->uFlags;
++		if (psOffset->uType != USEASM_REGTYPE_IMMEDIATE)
++		{
++			return IMG_FALSE;
++		}
++		uCount = psInst->uRepeat;
++		/* The low word of the offset is scaled by the high word, and a fetch adds the data size. */
++		uOffset = (psOffset->uNumber & 0xFFFF) * (psOffset->uNumber >> 16);
++		if ((g_psInstDesc[psInst->eOpcode].uFlags & DESC_FLAGS_MEMSTORE) == 0 &&
++			GetBit(psInst->auFlag, INST_FETCH))
++		{
++			uOffset += uDataSize;
++		}
++	}
++	*puLowest = uOffset;
++	*puHighest = uOffset + ((uCount > 1) ? uCount : 1) * uDataSize - 1;
++	return IMG_TRUE;
++}
++
++static
++IMG_BOOL MemAccessesMayAlias(PMEMACCESS_DATA psEarlier, PINST psLater)
++/*********************************************************************************
++ Function			: MemAccessesMayAlias
++
++ Description		: Check if two absolute addressed loads or stores might access
++					  the same memory.  They don't if:
++					  1) Either is to memory not aliased by other pointers and the
++					     base addresses are different.
++					  2) The base addresses are the same and the static ranges
++					     don't overlap.
++					  3) They're to different (known) memory address spaces.
++
++ Parameters			: psEarlier		- The earlier load or store.
++					  psLater		- The later one.
++
++ Return				: TRUE if they might.
++*********************************************************************************/
++{
++	PINST psInst = psEarlier->psInst;
++	IMG_UINT32 uFlags, uLaterFlags, uLowest, uHighest, uLaterLowest, uLaterHighest;
++	IMG_BOOL bRange = GetMemAccessRange(psInst, &uFlags, &uLowest, &uHighest);
++	IMG_BOOL bLaterRange = GetMemAccessRange(psLater, &uLaterFlags, &uLaterLowest, &uLaterHighest);
++	IMG_BOOL bSameBase = psInst->asArg[0].uType == psLater->asArg[0].uType &&
++						 psInst->asArg[0].uNumber == psLater->asArg[0].uNumber;
++	IMG_UINT32 uSpace = uFlags & ~UF_MEM_NOALIAS, uLaterSpace = uLaterFlags & ~UF_MEM_NOALIAS;
++
++	if (((uFlags | uLaterFlags) & UF_MEM_NOALIAS) && !bSameBase)
++	{
++		return IMG_FALSE;
++	}
++	if (bSameBase && !psEarlier->bAddressRegChanged && bRange && bLaterRange &&
++		(uHighest < uLaterLowest || uLaterHighest < uLowest))
++	{
++		return IMG_FALSE;
++	}
++	if (uSpace != 0 && uLaterSpace != 0 && uSpace != uLaterSpace)
++	{
++		return IMG_FALSE;
++	}
++	return IMG_TRUE;
++}
++
+ static
+ IMG_VOID ComputeLoadStoreDependence (PDGRAPH_STATE psDepState)
+ /*********************************************************************************
+  Function			: ComputeLoadStoreDependence
+ 
+- Description		: Calculate the dependency graph between loads and stores in a block.
+- 
++ Description		: Calculate the dependency graph between loads and stores in a block:
++					  a load or store after a store, and a store after a load, which might
++					  access the same memory keep their order.
++
+  Parameters			: psDepState	- Dependency graph state
+ 
+  Globals Effected	: None
+@@ -1592,187 +1707,77 @@ IMG_VOID ComputeLoadStoreDependence (PDGRAPH_STATE psDepState)
+  Return				: Nothing.
+ *********************************************************************************/
+ {
+-	typedef struct __STORE_DATA__ 
+-	{
+-		IMG_UINT32 uInst;
+-		PINST	 psStoreInst;
+-		IMG_BOOL bAddressRegChanged;
+-		USC_LIST_ENTRY sListEntry;
+-	} STORE_DATA, *PSTORE_DATA;
+-
+ 	IMG_UINT32 uInst;
+-	USC_LIST asStores;
++	USC_LIST asStores, asLoads;
++	PUSC_LIST psList;
+ 	PUSC_LIST_ENTRY psEntry;
+ 	PINTERMEDIATE_STATE psState = psDepState->psState;
+ 
+ 	InitializeList (&asStores);
++	InitializeList (&asLoads);
+ 
+-	/**
+-	 * Consider all stores using absolute addressing as a dependency of
+-	 * all absolute addressed loads/stores in this block unless it is known that:
+-	 * 1) The base addresses are different and the static offsets the same.
+-	 * 2) The base addresses are the same and the static offsets different.
+-	 * 3) The memory address spaces are different.
+-	 */
+ 	for (uInst = 0; uInst < psDepState->uBlockInstructionCount; ++uInst)
+ 	{
+ 		PINST psInst = ArrayGet(psState, psDepState->psInstructions, uInst);
+ 
+ 		if (TestInstructionGroup (psInst->eOpcode, USC_OPT_GROUP_ABS_MEMLDST))
+ 		{
+-			IMG_UINT32 uFetch;
+-			IMG_UINT8 uFlags;
+-			IMG_UINT32 uDataSize;
+-			IMG_UINT32 uImplicitOffset = 0;
++			IMG_BOOL bStore = (g_psInstDesc[psInst->eOpcode].uFlags & DESC_FLAGS_MEMSTORE) != 0;
++			PMEMACCESS_DATA psData;
+ 
+-			// Gather common data.
+-			if (psInst->eOpcode == ILOADMEMCONST)
+-			{
+-				uFetch = psInst->u.psLoadMemConst->uFetchCount;
+-				uFlags = psInst->u.psLoadMemConst->uFlags;
+-				uDataSize = psInst->u.psLoadMemConst->uDataSize;
+-			}
+-			else
++			/* Order after earlier stores and, for a store, after earlier loads. */
++			for (psList = &asStores; psList != NULL; psList = (bStore && psList == &asStores) ? &asLoads : NULL)
+ 			{
+-				uFetch = psInst->uRepeat;
+-				uFlags = psInst->u.psLdSt->uFlags;
+-
+-				switch (psInst->eOpcode)
++				for (psEntry = psList->psHead; psEntry != NULL; psEntry = psEntry->psNext)
+ 				{
+-				case ILDAD:
+-				case ISTAD:
+-					{
+-						uDataSize = 4;
+-						break;
+-					}
+-				case ILDAW:
+-				case ISTAW:
+-					{
+-						uDataSize = 2;
+-						break;
+-					}
+-				case ILDAB:
+-				case ISTAB:
++					psData = IMG_CONTAINING_RECORD (psEntry, PMEMACCESS_DATA, sListEntry);
++					if (MemAccessesMayAlias(psData, psInst))
+ 					{
+-						uDataSize = 1;
+-						break;
++						AddDependency(psDepState, psData->uInst, uInst);
+ 					}
+-				default:
+-					{
+-						imgabort ();
+-						break;
+-					}
+-				}
+-
+-				if (uFetch)
+-				{
+-					uImplicitOffset = uDataSize;
+ 				}
+ 			}
+ 
+-			psEntry = asStores.psHead;
+-			while (psEntry != NULL)
+-			{
+-				PSTORE_DATA psStoreData = IMG_CONTAINING_RECORD (psEntry, PSTORE_DATA, sListEntry);
+-
+-				/* 1) The base addresses point to different objects. */
+-				if (((uFlags & UF_MEM_NOALIAS) ||
+-					(psStoreData->psStoreInst->u.psLdSt->uFlags & UF_MEM_NOALIAS)) &&
+-					(psStoreData->psStoreInst->asArg[0].uType != psInst->asArg[0].uType ||
+-					psStoreData->psStoreInst->asArg[0].uNumber != psInst->asArg[0].uNumber))
+-				{
+-					psEntry = psEntry->psNext;
+-					continue;
+-				}
+-
+-				/* 2) The base addresses are the same and the static offsets different. */
+-				if (!psStoreData->bAddressRegChanged &&
+-					psInst->asArg[1].uType == USEASM_REGTYPE_IMMEDIATE &&
+-					psStoreData->psStoreInst->asArg[1].uType == USEASM_REGTYPE_IMMEDIATE && 
+-					psStoreData->psStoreInst->asArg[0].uType == psInst->asArg[0].uType &&
+-					psStoreData->psStoreInst->asArg[0].uNumber == psInst->asArg[0].uNumber)
+-				{
+-					/* Calculate the static offset range */
+-					IMG_UINT32 uOffsetLowest;
+-					IMG_UINT32 uOffsetHighest;
+-					IMG_UINT32 uSOffsetLowest;
+-					IMG_UINT32 uSOffsetHighest;
+-
+-					/* Get the instruction offset low-high range */
+-					uOffsetLowest = (0xFFFF & psInst->asArg[1].uNumber) + uImplicitOffset;
+-					uOffsetHighest = uOffsetLowest + (uFetch - 1) * uDataSize;
+-
+-					/* Get the store instruction offset low-high range */
+-					uSOffsetLowest = (0xFFFF & psStoreData->psStoreInst->asArg[1].uNumber);
+-					uSOffsetLowest *= psStoreData->psStoreInst->asArg[1].uNumber >> 16;
+-					uSOffsetHighest = uSOffsetLowest;
+-
+-					if (1 < psStoreData->psStoreInst->uRepeat)
+-					{
+-						uSOffsetHighest += psStoreData->psStoreInst->uRepeat * uDataSize;
+-					}
+-
+-					if (uSOffsetLowest < uOffsetLowest || uOffsetHighest < uSOffsetHighest)
+-					{
+-						psEntry = psEntry->psNext;
+-						continue;
+-					}
+-				}
+-
+-				/* 3) The memory address spaces are different. */
+-				if ((uFlags & ~UF_MEM_NOALIAS) !=
+-					(psStoreData->psStoreInst->u.psLdSt->uFlags & ~UF_MEM_NOALIAS))
+-				{
+-					psEntry = psEntry->psNext;
+-					continue;
+-				}
+-
+-				/* Assume dependent as we cannot prove otherwise */
+-				AddDependency(psDepState, psStoreData->uInst, uInst);
+-				psEntry = psEntry->psNext;
+-			}
+-
+-			if (g_psInstDesc[psInst->eOpcode].uFlags & DESC_FLAGS_MEMSTORE)
+-			{
+-				/* Track all mem stores. */
+-				PSTORE_DATA psStoreData = UscAlloc (psState, sizeof (STORE_DATA));
+-				psStoreData->uInst = uInst;
+-				psStoreData->psStoreInst = psInst;
+-				psStoreData->bAddressRegChanged = IMG_FALSE;
+-				AppendToList (&asStores, &psStoreData->sListEntry);
+-			}
++			psData = UscAlloc (psState, sizeof (MEMACCESS_DATA));
++			psData->uInst = uInst;
++			psData->psInst = psInst;
++			psData->bAddressRegChanged = IMG_FALSE;
++			AppendToList (bStore ? &asStores : &asLoads, &psData->sListEntry);
+ 		}
+ 		else
+ 		{
+ 			// Track any changes to address registers.
+-			psEntry = asStores.psHead;
+-			while (psEntry != NULL)
++			for (psList = &asStores; psList != NULL; psList = (psList == &asStores) ? &asLoads : NULL)
+ 			{
+-				PSTORE_DATA psStoreData = IMG_CONTAINING_RECORD (psEntry, PSTORE_DATA, sListEntry);
+-
+-				IMG_UINT32 d;
+-				for (d = 0; d < psInst->uDestCount; ++d)
++				for (psEntry = psList->psHead; psEntry != NULL; psEntry = psEntry->psNext)
+ 				{
+-					if (psStoreData->psStoreInst->asArg[0].uType == psInst->asDest[d].uType &&
+-						psStoreData->psStoreInst->asArg[0].uNumber == psInst->asDest[d].uNumber)
++					PMEMACCESS_DATA psData = IMG_CONTAINING_RECORD (psEntry, PMEMACCESS_DATA, sListEntry);
++					IMG_UINT32 d;
++
++					for (d = 0; d < psInst->uDestCount; ++d)
+ 					{
+-						psStoreData->bAddressRegChanged = IMG_TRUE;
+-						break;
++						if (psData->psInst->asArg[0].uType == psInst->asDest[d].uType &&
++							psData->psInst->asArg[0].uNumber == psInst->asDest[d].uNumber)
++						{
++							psData->bAddressRegChanged = IMG_TRUE;
++							break;
++						}
+ 					}
+ 				}
+-
+-				psEntry = psEntry->psNext;
+ 			}
+ 		}
+ 	}
+ 
+-	psEntry = asStores.psHead;
+-	while (psEntry != NULL)
++	for (psList = &asStores; psList != NULL; psList = (psList == &asStores) ? &asLoads : NULL)
+ 	{
+-		PUSC_LIST_ENTRY psNext = psEntry->psNext;
+-		PSTORE_DATA psStoreData = IMG_CONTAINING_RECORD (psEntry, PSTORE_DATA, sListEntry);
+-		UscFree (psState, psStoreData);
+-		psEntry = psNext;
++		psEntry = psList->psHead;
++		while (psEntry != NULL)
++		{
++			PUSC_LIST_ENTRY psNext = psEntry->psNext;
++			PMEMACCESS_DATA psData = IMG_CONTAINING_RECORD (psEntry, PMEMACCESS_DATA, sListEntry);
++			UscFree (psState, psData);
++			psEntry = psNext;
++		}
+ 	}
+ }
+ 
+diff --git a/tools/intern/usc2/iselect.c b/tools/intern/usc2/iselect.c
+index fc67c53..034dcfe 100644
+--- a/tools/intern/usc2/iselect.c
++++ b/tools/intern/usc2/iselect.c
+@@ -11424,6 +11424,26 @@ IMG_VOID MergeIdenticalInstructionsBP(PINTERMEDIATE_STATE psState, PCODEBLOCK ps
+ 		}
+ 
+ 		psInst->uId = uId;
++
++		/*
++			A memory load can't be replaced by an identical one from before a store, lock or
++			atomic operation which might have changed the memory (the constant buffer can't
++			change).
++		*/
++		if (psInst->eOpcode == ILOCK ||
++			psInst->eOpcode == IRELEASE ||
++			(g_psInstDesc[psInst->eOpcode].uFlags & DESC_FLAGS_MEMSTORE) != 0 ||
++			(psInst->eOpcode == ILOADMEMCONST && psInst->u.psLoadMemConst->bSynchronised))
++		{
++			for (uOpType = 0; uOpType < IOPCODE_MAX; uOpType++)
++			{
++				if ((g_psInstDesc[uOpType].uFlags & DESC_FLAGS_MEMLOAD) != 0 && uOpType != ILOADCONST)
++				{
++					InitializeList(&asMergeList[uOpType]);
++				}
++			}
++		}
++
+ 		if (!IsUnmergeableInst(psState, psInst))
+ 		{
+ 			PUSC_LIST	psMergeList;

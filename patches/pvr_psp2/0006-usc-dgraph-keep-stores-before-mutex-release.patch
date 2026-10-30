@@ -1,0 +1,19 @@
+USC: keep the instruction before a mutex release inside the lock
+
+ComputeMutexLockDependence made the release depend on the instructions after
+the lock up to uInst - 2, missing the one right before the release (for an
+atomic, its store), which could then be scheduled after it.
+
+diff --git a/tools/intern/usc2/dgraph.c b/tools/intern/usc2/dgraph.c
+index 57e3e54..dcc0132 100644
+--- a/tools/intern/usc2/dgraph.c
++++ b/tools/intern/usc2/dgraph.c
+@@ -1834,7 +1834,7 @@ IMG_VOID ComputeMutexLockDependence(PDGRAPH_STATE psDepState)
+ 			bLocked = IMG_FALSE;
+ 			/* To prevent instruction from being moved outside of the lock, set the release
+ 			 instruction as dependent on every instruction in the lock section */
+-			for (++uLockInst; uLockInst < (uInst-1); ++uLockInst)
++			for (++uLockInst; uLockInst < uInst; ++uLockInst)
+ 				AddDependency(psDepState, uLockInst, uInst);
+ 
+ 			/* To prevent instructions from being moved into the lock section,

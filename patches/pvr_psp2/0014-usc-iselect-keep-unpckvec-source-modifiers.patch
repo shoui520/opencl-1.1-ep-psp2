@@ -1,0 +1,25 @@
+USC: don't turn an UNPCKVEC with a source modifier into a MOV
+
+VMOVReplaceArguments replaced an UNPCKVEC of scalar sources by a MOV even
+when the UNPCKVEC negated or took the absolute value of its source, which a
+MOV can't do, so fabs() and the like were lost (fmod and pow of negative
+values).  Keep the UNPCKVEC; FixVectorSourceModifiers lowers the modifier.
+
+diff --git a/tools/intern/usc2/iselect.c b/tools/intern/usc2/iselect.c
+index 0da4a83..8b3f0ee 100644
+--- a/tools/intern/usc2/iselect.c
++++ b/tools/intern/usc2/iselect.c
+@@ -8107,7 +8107,12 @@ static IMG_BOOL VMOVReplaceArguments(PINTERMEDIATE_STATE	psState,
+ 
+ 	if (!bCheckOnly)
+ 	{
+-		if (psInst->eOpcode == IUNPCKVEC && psContext->bScalarSources)
++		/*
++			A MOV can't apply the unpack's source modifier: keep the UNPCKVEC
++			(FixVectorSourceModifiers lowers it later).
++		*/
++		if (psInst->eOpcode == IUNPCKVEC && psContext->bScalarSources &&
++			!psInst->u.psVec->asSrcMod[0].bNegate && !psInst->u.psVec->asSrcMod[0].bAbs)
+ 		{
+ 			if (psInst->u.psVec->aeSrcFmt[0] == UF_REGFORMAT_F32)
+ 			{

@@ -1,0 +1,34 @@
+USC: apply negate modifiers to both IMA32 steps on SGX543/544
+
+32-bit MUL/MAD are two IMA32 steps (A * B.low16, then A * B.high16).  The
+negate flags meant for the second step were written to the first, so a
+negated multiply source was only negated in half of the product.
+
+diff --git a/tools/intern/usc2/icvt_i32.c b/tools/intern/usc2/icvt_i32.c
+index e7dac2f..d8e4f18 100644
+--- a/tools/intern/usc2/icvt_i32.c
++++ b/tools/intern/usc2/icvt_i32.c
+@@ -572,9 +572,9 @@ IMG_VOID GenerateIMA32Instruction_543(PINTERMEDIATE_STATE		psState,
+ 			SetDest(psState, psIma32Inst, 0 /* uDestIdx */, USEASM_REGTYPE_TEMP, GetNextRegister(psState), UF_REGFORMAT_F32);
+ 
+ 			SetSrcFromArg(psState, psIma32InstStep2, 0 /* uSrcIdx */, psArgA);
+-			psIma32Inst->u.psIma32->abNegate[0] = bNegateA;
++			psIma32InstStep2->u.psIma32->abNegate[0] = bNegateA;
+ 			SetSrcFromArg(psState, psIma32InstStep2, 1 /* uSrcIdx */, psArgB);
+-			psIma32Inst->u.psIma32->abNegate[1] = bNegateB;
++			psIma32InstStep2->u.psIma32->abNegate[1] = bNegateB;
+ 			SetSrcFromArg(psState, psIma32InstStep2, 2 /* uSrcIdx */, &psIma32Inst->asDest[0]);
+ 			psIma32InstStep2->asArg[2] = psIma32Inst->asDest[0];
+ 			break;
+@@ -608,9 +608,9 @@ IMG_VOID GenerateIMA32Instruction_543(PINTERMEDIATE_STATE		psState,
+ 			SetDest(psState, psIma32Inst, 0 /* uDestIdx */, USEASM_REGTYPE_TEMP, GetNextRegister(psState), UF_REGFORMAT_F32);
+ 
+ 			SetSrcFromArg(psState, psIma32InstStep2, 0 /* uSrcIdx */, psArgA);
+-			psIma32Inst->u.psIma32->abNegate[0] = bNegateA;
++			psIma32InstStep2->u.psIma32->abNegate[0] = bNegateA;
+ 			SetSrcFromArg(psState, psIma32InstStep2, 1 /* uSrcIdx */, psArgB);
+-			psIma32Inst->u.psIma32->abNegate[1] = bNegateB;
++			psIma32InstStep2->u.psIma32->abNegate[1] = bNegateB;
+ 			SetSrcFromArg(psState, psIma32InstStep2, 2 /* uSrcIdx */, &psIma32Inst->asDest[0]);
+ 
+ 			break;

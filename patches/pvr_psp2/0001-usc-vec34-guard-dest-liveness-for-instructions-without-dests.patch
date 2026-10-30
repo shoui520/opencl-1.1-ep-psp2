@@ -1,0 +1,48 @@
+USC: don't read auLiveChansInDest[0] of instructions without destinations
+
+The vector dual-issue pass passes psInst->auLiveChansInDest[0] to
+IsPossibleDualIssueOp for every instruction.  Instructions with no
+destination (the ILOCK/IRELEASE pair around OpenCL atomics) have no such
+array, so compiling any atomic for SGX543/544 crashed.
+IsPossibleDualIssueOp already rejects those instructions.
+
+diff --git a/tools/intern/usc2/vec34.c b/tools/intern/usc2/vec34.c
+index 8dec22e..815b82c 100644
+--- a/tools/intern/usc2/vec34.c
++++ b/tools/intern/usc2/vec34.c
+@@ -15488,7 +15488,7 @@ IMG_VOID VecDualUpdateInstructionAfterSubstitution(PINTERMEDIATE_STATE psState,
+ 	eSetupOp = psInst->sStageData.psVDIData->sInstData.eSetupOp;
+ 	psInst->sStageData.psVDIData->bIsPossibleDualOp = IsPossibleDualIssueOp(	psState, 
+ 																				psInst, 
+-																				psInst->auLiveChansInDest[0],
++																				psInst->uDestCount > 0 ? psInst->auLiveChansInDest[0] : 0,
+ 																				0 /* uRequireUnifiedStoreSrcMask */, 
+ 																				IMG_FALSE /* bRequireNotUnifiedStoreSlot */,
+ 																				IMG_TRUE /* bSetHintInternalRegReplacement */,
+@@ -20471,7 +20471,7 @@ IMG_BOOL IsPossibleDualIssueWithVMOV(PINTERMEDIATE_STATE	psState,
+ 	*/
+ 	if (!IsPossibleDualIssueOp(psState, 
+ 							   psInst, 
+-							   psInst->auLiveChansInDest[0],
++							   psInst->uDestCount > 0 ? psInst->auLiveChansInDest[0] : 0,
+ 							   0 /* uRequireUnifiedStoreSrcMaskt */, 
+ 							   IMG_TRUE /* bRequireNotUnifiedStoreSlot */,
+ 							   IMG_FALSE /* bSetHintInternalRegReplacement */,
+@@ -20602,7 +20602,7 @@ IMG_BOOL ConvertSingleInstToDualIssue(PINTERMEDIATE_STATE	psState,
+ 	*/
+ 	if (!IsPossibleDualIssueOp(psState, 
+ 							   psInst, 
+-							   psInst->auLiveChansInDest[0],
++							   psInst->uDestCount > 0 ? psInst->auLiveChansInDest[0] : 0,
+ 							   uUnifiedStoreSrcMask, 
+ 							   IMG_FALSE /* bRequireNotUnifiedStoreSlot */, 
+ 							   IMG_FALSE /* bSetHintInternalRegReplacement */,
+@@ -20777,7 +20777,7 @@ IMG_VOID GenerateVectorDualIssueBP(PINTERMEDIATE_STATE	psState,
+ 		/* Check if this instruction could be dual-issued. */
+ 		psInst->sStageData.psVDIData->bIsPossibleDualOp	= IsPossibleDualIssueOp(psState, 
+ 																				psInst, 
+-																				psInst->auLiveChansInDest[0],
++																				psInst->uDestCount > 0 ? psInst->auLiveChansInDest[0] : 0,
+ 																				0 /* uRequireUnifiedStoreSrcMask */, 
+ 																				IMG_FALSE /* bRequireNotUnifiedStoreSlot */,
+ 																				IMG_TRUE /* bSetHintInternalRegReplacement */,
