@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "toolchain file")
+endif()
+project(pvrsc_check C)
+include(${CMAKE_CURRENT_LIST_DIR}/../CMakeLists.txt)
