@@ -5,7 +5,7 @@
     clbin.py [-o out.bin] [-O "build options"] [-w workdir] file.cl
 
 The host compiler driver (tools/oclc/oclc.c, under qemu) is run as $OCLC
-(default "oclc").  Kernel-scope __local variables are moved into a hidden
+(default "oclc"); tools/oclc/setup.sh builds it as build/oclc/oclc.  Kernel-scope __local variables are moved into a hidden
 argument first (locals.py), and each kernel's USP output is packaged as a
 GXM vertex program (tools/gxp/mkgxp.py).  The format is described in
 runtime/cl/program.c.
