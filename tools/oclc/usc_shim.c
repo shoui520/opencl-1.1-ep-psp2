@@ -255,6 +255,218 @@ static PUNIFLEX_INST zero_unwritten_temps(PUNIFLEX_INST prog, PUNIFLEX_INST zero
 	return prog;
 }
 
+/*
+ * The front end ends a block with the copies into the phi registers of the
+ * block it jumps to, but doesn't always order them so each copy reads the
+ * value from before the copies: at the end of a loop doing b = a; a = t;
+ * it can copy t into a and then a (now t) into b.  A copy reads such a value
+ * when its source is the destination of an earlier copy in the run that
+ * wrote every channel it reads, and the register has a definition in
+ * another block, so it's a phi register (a temporary assembled a channel at
+ * a time, or written in this block only, is read as written).  Each such
+ * source is saved in a new temporary before the run and read from there.
+ */
+#define MAX_PHI_SAVES	256
+
+static struct phi_save {
+	PUNIFLEX_INST mov, prev, reader;
+	UF_REGISTER src;
+} phi_saves[MAX_PHI_SAVES];
+static int phi_save_count;
+
+static IMG_UINT32 src_chans(const UNIFLEX_INST *inst)
+{
+	IMG_UINT32 c, s, mask = 0;
+
+	for (c = 0; c < 4; c++)
+		if (inst->sDest.u.byMask & (1 << c)) {
+			s = (inst->asSrc[0].u.uSwiz >> (c * 3)) & 7;
+			if (s < 4)
+				mask |= 1 << s;
+		}
+	return mask;
+}
+
+static int is_plain_mov(const UNIFLEX_INST *inst)
+{
+	return inst->eOpCode == UFOP_MOV && inst->uPredicate == UF_PRED_NONE &&
+	       inst->sDest.eType == UFREG_TYPE_TEMP && inst->sDest.eRelativeIndex == UFREG_RELATIVEINDEX_NONE &&
+	       inst->sDest.byMod == 0;
+}
+
+static void order_phi_copies(PUNIFLEX_INST prog)
+{
+	PUNIFLEX_INST inst, prev, first, i, j;
+	IMG_UINT32 count = 0, block, next_temp, k;
+	IMG_INT32 *def_block;
+
+	phi_save_count = 0;
+	for (inst = prog; inst; inst = inst->psILink) {
+		if (inst->sDest.eType == UFREG_TYPE_TEMP && inst->sDest.uNum + dest_regs(inst) > count)
+			count = inst->sDest.uNum + dest_regs(inst);
+		if (inst->sDest2.eType == UFREG_TYPE_TEMP && inst->sDest2.uNum >= count)
+			count = inst->sDest2.uNum + 1;
+		for (k = 0; k < UNIFLEX_MAXIMUM_SOURCE_ARGUMENT_COUNT; k++)
+			if (inst->asSrc[k].eType == UFREG_TYPE_TEMP && inst->asSrc[k].uNum >= count)
+				count = inst->asSrc[k].uNum + 1;
+	}
+	next_temp = count;
+	/* the block of each temporary's definitions, -1 for none, -2 for several */
+	def_block = malloc(count * sizeof(*def_block));
+	if (!def_block)
+		return;
+	memset(def_block, 0xff, count * sizeof(*def_block));
+	block = 0;
+	for (inst = prog; inst; inst = inst->psILink) {
+		PCINPUT_INST_DESC desc = PVRUniFlexGetInputInstDesc(inst->eOpCode);
+
+		if (inst->eOpCode == UFOP_BLOCK || inst->eOpCode == UFOP_LABEL)
+			block++;
+		if (!desc || desc->uNumDests < 1 || inst->sDest.eType != UFREG_TYPE_TEMP)
+			continue;
+		for (k = 0; k < dest_regs(inst); k++) {
+			IMG_INT32 *d = &def_block[inst->sDest.uNum + k];
+
+			*d = *d == -1 || *d == (IMG_INT32)block ? (IMG_INT32)block : -2;
+		}
+	}
+	block = 0;
+	prev = NULL;
+	for (inst = prog; inst; prev = inst, inst = inst->psILink) {
+		if (inst->eOpCode == UFOP_BLOCK || inst->eOpCode == UFOP_LABEL)
+			block++;
+		if (!prev || !is_plain_mov(inst) || is_plain_mov(prev))
+			continue;
+		/* a run of copies starting at inst: does it end in a jump? */
+		for (j = inst; j && is_plain_mov(j); j = j->psILink)
+			;
+		if (!j || j->eOpCode != UFOP_JUMP)
+			continue;
+		first = inst;
+		for (j = first->psILink; j->eOpCode != UFOP_JUMP; j = j->psILink) {
+			const UF_REGISTER *r = &j->asSrc[0];
+			PUNIFLEX_INST writer = NULL, mov;
+			struct phi_save *save;
+
+			if (r->eType != UFREG_TYPE_TEMP || r->eRelativeIndex != UFREG_RELATIVEINDEX_NONE ||
+			    r->uNum >= count || def_block[r->uNum] == (IMG_INT32)block)
+				continue;
+			for (i = first; i != j; i = i->psILink)
+				if (i->sDest.uNum == r->uNum)
+					writer = i;
+			if (!writer || (src_chans(j) & ~writer->sDest.u.byMask & 0xf) ||
+			    phi_save_count == MAX_PHI_SAVES || !(mov = calloc(1, sizeof(*mov))))
+				continue;
+			mov->eOpCode = UFOP_MOV;
+			set_reg(&mov->sDest, UFREG_TYPE_TEMP, next_temp++, r->eFormat);
+			mov->sDest.u.byMask = src_chans(j);
+			set_reg(&mov->asSrc[0], UFREG_TYPE_TEMP, r->uNum, r->eFormat);
+			mov->asSrc[0].u.uSwiz = UFREG_SWIZ_NONE;
+			mov->uPredicate = UF_PRED_NONE;
+			mov->psILink = prev->psILink;
+			prev->psILink = mov;
+			save = &phi_saves[phi_save_count++];
+			save->mov = mov;
+			save->prev = prev;
+			save->reader = j;
+			save->src = j->asSrc[0];
+			j->asSrc[0].uNum = mov->sDest.uNum;
+		}
+	}
+	free(def_block);
+}
+
+/* Undo order_phi_copies. */
+static void restore_phi_copies(void)
+{
+	while (phi_save_count > 0) {
+		struct phi_save *save = &phi_saves[--phi_save_count];
+
+		save->prev->psILink = save->mov->psILink;
+		save->reader->asSrc[0] = save->src;
+		free(save->mov);
+	}
+}
+
+/*
+ * The front end reads an element of a __constant array indexed at run time
+ * as I32 whatever its type, and a float one is then moved to F32, which USC
+ * takes as a conversion from integer.  Such a MOV, from a relatively indexed
+ * I32 or U32 constant or from a temporary only defined by a copy of one, is
+ * made a REINTERP.  Returns the number made; restore_const_reads undoes it.
+ */
+#define MAX_CONST_READS	256
+
+static PUNIFLEX_INST const_reads[MAX_CONST_READS];
+static int const_read_count;
+
+static int is_int_fmt(UF_REGFORMAT fmt)
+{
+	return fmt == UF_REGFORMAT_I32 || fmt == UF_REGFORMAT_U32;
+}
+
+static int is_indexed_const_read(const UF_REGISTER *r)
+{
+	return r->eType == UFREG_TYPE_CONST && r->eRelativeIndex != UFREG_RELATIVEINDEX_NONE &&
+	       is_int_fmt(r->eFormat) && r->byMod == 0;
+}
+
+static int reinterpret_const_reads(PUNIFLEX_INST prog)
+{
+	PUNIFLEX_INST inst;
+	IMG_UINT32 count = 0;
+	/* per temporary: 1 if its only definition copies an indexed constant,
+	 * 2 if it has any other definition */
+	unsigned char *from_const;
+
+	const_read_count = 0;
+	for (inst = prog; inst; inst = inst->psILink)
+		if (inst->sDest.eType == UFREG_TYPE_TEMP && inst->sDest.uNum + dest_regs(inst) > count)
+			count = inst->sDest.uNum + dest_regs(inst);
+	from_const = calloc(count + 1, 1);
+	if (!from_const)
+		return 0;
+	for (inst = prog; inst; inst = inst->psILink) {
+		PCINPUT_INST_DESC desc = PVRUniFlexGetInputInstDesc(inst->eOpCode);
+		IMG_UINT32 k;
+
+		if (desc && desc->uNumDests >= 2 && inst->sDest2.eType == UFREG_TYPE_TEMP &&
+		    inst->sDest2.uNum < count)
+			from_const[inst->sDest2.uNum] = 2;
+		if (!desc || desc->uNumDests < 1 || inst->sDest.eType != UFREG_TYPE_TEMP)
+			continue;
+		if (inst->eOpCode == UFOP_MOV && inst->uPredicate == UF_PRED_NONE &&
+		    inst->sDest.eRelativeIndex == UFREG_RELATIVEINDEX_NONE && is_int_fmt(inst->sDest.eFormat) &&
+		    is_indexed_const_read(&inst->asSrc[0]) && !from_const[inst->sDest.uNum]) {
+			from_const[inst->sDest.uNum] = 1;
+			continue;
+		}
+		for (k = 0; k < dest_regs(inst); k++)
+			from_const[inst->sDest.uNum + k] = 2;
+	}
+	for (inst = prog; inst && const_read_count < MAX_CONST_READS; inst = inst->psILink) {
+		const UF_REGISTER *r = &inst->asSrc[0];
+
+		if (inst->eOpCode != UFOP_MOV || inst->sDest.eFormat != UF_REGFORMAT_F32 ||
+		    inst->sDest.byMod != 0 || r->byMod != 0 || !is_int_fmt(r->eFormat))
+			continue;
+		if (is_indexed_const_read(r) ||
+		    (r->eType == UFREG_TYPE_TEMP && r->eRelativeIndex == UFREG_RELATIVEINDEX_NONE &&
+		     r->uNum < count && from_const[r->uNum] == 1)) {
+			inst->eOpCode = UFOP_REINTERP;
+			const_reads[const_read_count++] = inst;
+		}
+	}
+	free(from_const);
+	return const_read_count;
+}
+
+static void restore_const_reads(void)
+{
+	while (const_read_count > 0)
+		const_reads[--const_read_count]->eOpCode = UFOP_MOV;
+}
+
 /* Take the instructions first..last back out of the program and free them;
  * returns the program. */
 static PUNIFLEX_INST unlink_added(PUNIFLEX_INST prog, PUNIFLEX_INST first, PUNIFLEX_INST last)
@@ -578,8 +790,10 @@ IMG_UINT32 IMG_CALLCONV PVRUniFlexCompileToUspBin(IMG_PVOID pvContext, IMG_UINT3
 				return UF_ERR_GENERIC;
 			}
 		}
+		reinterpret_const_reads(psSWProc);
+		order_phi_copies(psSWProc);
 		psSWProc = zero_unwritten_temps(psSWProc, zeros);
-		if (prefix && (gxm || zeros[0]))
+		if (prefix && (gxm || zeros[0] || phi_save_count || const_read_count))
 			dump_program(prefix, n + 1000, *pui32Flags, psSWProc, psConstants, &params, sizeof(params));
 		err = psp2_PVRUniFlexCompileToUspBin(pvContext, pui32Flags, psSWProc, psConstants, &params,
 						     ppsPCShader);
@@ -588,6 +802,8 @@ IMG_UINT32 IMG_CALLCONV PVRUniFlexCompileToUspBin(IMG_PVOID pvContext, IMG_UINT3
 			psSWProc = unlink_added(psSWProc, zeros[0], zeros[1]);
 		if (added[0])
 			psSWProc = unlink_added(psSWProc, added[0], added[1]);
+		restore_phi_copies();
+		restore_const_reads();
 	}
 	if (!err && n < MAX_PROGRAMS)
 		programs[n] = *ppsPCShader;
