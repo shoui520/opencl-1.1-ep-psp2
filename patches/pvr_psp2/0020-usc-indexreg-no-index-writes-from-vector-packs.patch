@@ -1,0 +1,37 @@
+USC: don't move an index register write into a pack on vec34
+
+When the temporary copied into an index register was made by a U16U16 (or
+S16S8, U16U8) unpack, the index register became the unpack's destination,
+which on a vector core expands to a VPCK for each half of the register.
+The index register can't be written a half at a time and the VPCK of the
+upper half (with 0) overwrote the index, so a program-scope __constant
+int array indexed at run time always read its first element.  Keep the
+move, which is encoded as a whole-register IMA16.
+
+diff --git a/tools/intern/usc2/indexreg.c b/tools/intern/usc2/indexreg.c
+index 6795b48..6a158b7 100644
+--- a/tools/intern/usc2/indexreg.c
++++ b/tools/intern/usc2/indexreg.c
+@@ -3135,6 +3135,22 @@ IMG_VOID FoldIndexRegisterWrite(PINTERMEDIATE_STATE psState, PINST psIndexMoveIn
+ 		return;
+ 	}
+ 
++	#if defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554)
++	/*
++		On a vector core these become a VPCK per half of the destination, and
++		the index register can't be written a half at a time: the second VPCK
++		writes over the first.
++	*/
++	if ((psState->psTargetFeatures->ui32Flags & SGX_FEATURE_FLAGS_USE_VEC34) != 0 &&
++		(psMovSrcDefInst->eOpcode == IUNPCKU16U16 ||
++		 psMovSrcDefInst->eOpcode == IUNPCKS16S8 ||
++		 psMovSrcDefInst->eOpcode == IUNPCKU16U8 ||
++		 (g_psInstDesc[psMovSrcDefInst->eOpcode].uFlags & DESC_FLAGS_VECTORDEST) != 0))
++	{
++		return;
++	}
++	#endif /* defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554) */
++
+ 	/*
+ 		Check the defining instruction doesn't partially define the move source.
+ 	*/
