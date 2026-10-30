@@ -469,3 +469,161 @@ CASES += [
          Buf('f4', N, with_specials(FP_B, -1000.0, 1000.0)), Buf('f4', 4 * N, 'zeros')],
          check=fp_ops_check, skip_compare=(2,)),
 ]
+
+
+# Whole programs (tests/kernels/programs.cl).  Float results are compared with
+# a relative tolerance: the device rounds toward zero, pocl to nearest, and the
+# difference builds up over long sums.
+PR = K + 'programs.cl'
+
+
+def close_check(index, rtol, atol):
+    def f(inputs, ref, dev):
+        r, d = ref[index].astype(np.float64).reshape(-1), dev[index].astype(np.float64).reshape(-1)
+        bad = ~(np.abs(d - r) <= atol + rtol * np.abs(r))
+        errs = ['arg%d[%d]: device %r, pocl %r' % (index, j, d[j], r[j])
+                for j in np.nonzero(bad)[0][:4]]
+        if bad.sum() > 4:
+            errs.append('arg%d: %d of %d outside the tolerance' % (index, bad.sum(), len(r)))
+        return errs
+    return f
+
+
+def checks(*fs):
+    return lambda inputs, ref, dev: sum((f(inputs, ref, dev) for f in fs), [])
+
+
+def mandelbrot_check(inputs, ref, dev):
+    # rounding can move a point just inside or outside the escape test
+    r, d = ref[0].reshape(-1), dev[0].reshape(-1)
+    differ = np.count_nonzero(r != d)
+    if differ > len(r) // 200:
+        return ['%d of %d pixels differ from pocl (allowing 0.5%%)' % (differ, len(r))]
+    return []
+
+
+def sha256_check(inputs, ref, dev):
+    import hashlib
+    msgs = inputs[0].reshape(-1, 55)
+    want = np.frombuffer(b''.join(hashlib.sha256(m.tobytes()).digest() for m in msgs), '>u4')
+    got = dev[1].reshape(-1)
+    bad = np.nonzero(got != want)[0]
+    return ['digest %d word %d: %08x, hashlib %08x' % (j // 8, j % 8, got[j], want[j])
+            for j in bad[:4]]
+
+
+def histogram_check(inputs, ref, dev):
+    want = np.bincount(inputs[0].reshape(-1), minlength=256)
+    got = dev[1].reshape(-1)
+    return [] if (got == want).all() else ['bins differ from np.bincount: %d of 256' %
+                                          np.count_nonzero(got != want)]
+
+
+def csr(n, max_per_row, seed=7):
+    rng = np.random.default_rng(seed)
+    counts = rng.integers(0, max_per_row, n, endpoint=True)
+    row_ptr = np.concatenate(([0], np.cumsum(counts))).astype(np.int32)
+    cols = np.concatenate([np.sort(rng.choice(n, c, replace=False)) for c in counts]).astype(np.int32)
+    vals = rng.uniform(-1, 1, len(cols)).astype(np.float32)
+    return row_ptr, cols, vals
+
+
+CSR = csr(1000, 16)
+
+
+def bodies(n, seed=3):
+    rng = np.random.default_rng(seed)
+    p = rng.uniform(-1, 1, (n, 4)).astype(np.float32)
+    p[:, 3] = rng.uniform(0.5, 1.0, n)
+    return p
+
+
+def program_bitonic(s, rng):
+    n = 1024
+    s.buffer(0, rng.integers(0, 2 ** 32, n, dtype=np.uint32).tobytes())
+    s.kernel(0, 'bitonic_step')
+    s.add('arg_mem', kid=0, index=0, id=0)
+    for stage in range(10):
+        for p in range(stage + 1):
+            s.add('arg_value', kid=0, index=1, data=np.int32(stage).tobytes(), size=4)
+            s.add('arg_value', kid=0, index=2, data=np.int32(p).tobytes(), size=4)
+            s.ndrange(0, (n // 2,))
+    s.read(0, n * 4)
+
+
+def program_scan(s, rng):
+    n = 4096
+    s.buffer(0, ints(rng, n, -100, 100))
+    s.buffer(1, bytes(n * 4))
+    s.kernel(0, 'scan_step')
+    src, d = 0, 1
+    while d < n:
+        s.add('arg_mem', kid=0, index=0, id=src)
+        s.add('arg_mem', kid=0, index=1, id=1 - src)
+        s.add('arg_value', kid=0, index=2, data=np.int32(d).tobytes(), size=4)
+        s.ndrange(0, (n,))
+        src, d = 1 - src, d * 2
+    s.read(src, n * 4)
+
+
+CASES += [
+    Case('sgemm', PR, 'sgemm', (64, 64), [Buf('f4', 64 * 128, lo=-1.0, hi=1.0),
+         Buf('f4', 128 * 64, lo=-1.0, hi=1.0), Buf('f4', 64 * 64, 'zeros'), Val(np.int32(128))],
+         check=close_check(2, 1e-4, 1e-4), skip_compare=(2,)),
+    Case('sgemm4', PR, 'sgemm4', (16, 64), [Buf('f4', 64 * 128, lo=-1.0, hi=1.0),
+         Buf('(4,)f4', 128 * 16, lo=-1.0, hi=1.0), Buf('(4,)f4', 64 * 16, 'zeros'),
+         Val(np.int32(128))], check=close_check(2, 1e-4, 1e-4), skip_compare=(2,)),
+    Case('blur5', PR, 'blur5', (128, 96), [Buf('f4', 128 * 96, lo=0.0, hi=1.0),
+         Buf('f4', 128 * 96, 'zeros')], check=close_check(1, 1e-5, 1e-6), skip_compare=(1,)),
+    Case('sobel', PR, 'sobel', (160, 120), [Buf('u1', 160 * 120), Buf('u1', 160 * 120, 'zeros')]),
+    Case('mandelbrot', PR, 'mandelbrot', (192, 128), [Buf('i4', 192 * 128, 'zeros'),
+         Val(np.int32(64))], check=mandelbrot_check, skip_compare=(0,)),
+    Case('nbody', PR, 'nbody', (256,), [Buf('(4,)f4', 256, values=bodies(256)),
+         Buf('(4,)f4', 256, lo=-0.1, hi=0.1), Buf('(4,)f4', 256, 'zeros'),
+         Buf('(4,)f4', 256, 'zeros'), Val(np.int32(256)), Val(np.float32(0.01))],
+         check=checks(close_check(2, 1e-4, 1e-5), close_check(3, 1e-3, 1e-4)),
+         skip_compare=(2, 3)),
+    Case('spmv_csr', PR, 'spmv_csr', (1000,), [Buf('i4', 1001, values=CSR[0]),
+         Buf('i4', len(CSR[1]), values=CSR[1]), Buf('f4', len(CSR[2]), values=CSR[2]),
+         Buf('f4', 1000, lo=-1.0, hi=1.0), Buf('f4', 1000, 'zeros')],
+         check=close_check(4, 1e-4, 1e-5), skip_compare=(4,)),
+    Case('black_scholes', PR, 'black_scholes', (1000,), [Buf('f4', 1000, lo=5.0, hi=30.0),
+         Buf('f4', 1000, lo=1.0, hi=100.0), Buf('f4', 1000, lo=0.25, hi=10.0),
+         Buf('f4', 1000, 'zeros'), Buf('f4', 1000, 'zeros'), Val(np.float32(0.02)),
+         Val(np.float32(0.30))], check=checks(close_check(3, 1e-3, 1e-3), close_check(4, 1e-3, 1e-3)),
+         skip_compare=(3, 4)),
+    Case('sha256', PR, 'sha256', (256,), [Buf('u1', 256 * 55), Buf('u4', 256 * 8, 'zeros')],
+         check=sha256_check),
+    Case('histogram', PR, 'histogram', (4096,), [Buf('u1', 4096 * 16), Buf('u4', 256, 'zeros')],
+         check=histogram_check),
+    ApiCase('bitonic_sort', PR, program_bitonic),
+    ApiCase('prefix_scan', PR, program_scan),
+]
+
+
+# Program-scope __constant arrays indexed at run time (tests/kernels/constant.cl).
+CT = K + 'constant.cl'
+SHA_K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+         0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+         0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+         0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+         0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+         0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+         0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+         0xc67178f2]
+
+CASES += [
+    Case('const_tab', CT, 'const_tab', (256,), [Buf('i4', 256, lo=0, hi=5), Buf('i4', 256, 'zeros')]),
+    Case('const_ftab', CT, 'const_ftab', (256,), [Buf('i4', 256, lo=0, hi=15),
+         Buf('f4', 256, 'zeros')]),
+    Case('sha_schedule', CT, 'sha_schedule', (64,), [Buf('u1', 64 * 55),
+         Buf('u4', 64 * 64, 'zeros')]),
+    Case('sha256_k', CT, 'sha256_k', (256,), [Buf('u1', 256 * 55), Buf('u4', 256 * 8, 'zeros'),
+         Buf('u4', 64, values=SHA_K)], check=sha256_check),
+    Case('sha_funcs', CT, 'sha_funcs', (256,), [Buf('u4', 256 * 3), Buf('u4', 256 * 4, 'zeros')]),
+] + [
+    Case('sha_rounds%d' % n, CT, 'sha_rounds', (64,), [Buf('u4', 64 * 64), Buf('u4', 64 * 8, 'zeros'),
+         Buf('u4', 64, values=SHA_K), Val(np.int32(n))]) for n in (1, 2, 3, 8, 64)
+]
