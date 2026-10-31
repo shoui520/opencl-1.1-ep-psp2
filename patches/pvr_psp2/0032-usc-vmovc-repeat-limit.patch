@@ -1,0 +1,31 @@
+USC: at most 4 repeats of a VMOVC
+
+The instruction grouping took a VMOVC's maximum repeat count from the
+instruction description (16), but the vec34 encoding has room for 4, so a
+select of 8 or 16-component vectors of ints or floats could be grouped into
+one VMOVC the assembler refused ("The maximum repeat count on vmovc is 4").
+Limit the vector MOVCs to SGXVEC_USE1_VMOVC_RCNT_MAXIMUM.
+
+diff --git a/tools/intern/usc2/inst_usc.c b/tools/intern/usc2/inst_usc.c
+--- a/tools/intern/usc2/inst_usc.c
++++ b/tools/intern/usc2/inst_usc.c
+@@ -14702,6 +14702,19 @@
+ 		}
+ 	}
+ 	#endif /* defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554) || defined(SUPPORT_SGX545) */
++
++	#if defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554)
++	/*
++		VMOVC encodes at most 4 repeats.
++	*/
++	if (psInst->eOpcode == IVMOVC ||
++		psInst->eOpcode == IVMOVCU8_FLT ||
++		psInst->eOpcode == IVMOVC_I32 ||
++		psInst->eOpcode == IVMOVCU8_I32)
++	{
++		uMaxRepeatCount = min(uMaxRepeatCount, SGXVEC_USE1_VMOVC_RCNT_MAXIMUM);
++	}
++	#endif /* defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554) */
+ 	
+ 	#if defined (SUPPORT_SGX545)
+ 	/*

@@ -1,0 +1,44 @@
+USC: float >= of equal infinities
+
+A float SETBGE is a TESTMASK of the difference of its sources against zero,
+and the difference of two equal infinities fails the >= 0 test (OpenCL's
+<= and >= gave false for inf, inf and -inf, -inf), though it passes the
+== 0 one SETBEQ uses.  The equality test is ORed in.
+
+diff --git a/tools/intern/usc2/icvt_f32.c b/tools/intern/usc2/icvt_f32.c
+index da10dea..96dcfe7 100644
+--- a/tools/intern/usc2/icvt_f32.c
++++ b/tools/intern/usc2/icvt_f32.c
+@@ -2039,6 +2039,32 @@ static IMG_VOID ConvertVectorInstructionF32(PINTERMEDIATE_STATE psState, PCODEBL
+ 		/* Insert the new instruction in the current block. */
+ 		AppendInst(psState, psCodeBlock, psInst);
+ 
++		if (psSrc->eOpCode == UFOP_SETBGE)
++		{
++			PINST	psEqInst;
++			PINST	psOrInst;
++
++			/*
++				The difference of two equal infinities doesn't pass the >= 0 test,
++				but the == 0 one: OR in the test for equality.
++			*/
++			psEqInst = CopyInst(psState, psInst);
++			psEqInst->u.psTest->sTest.eType = TEST_TYPE_EQ_ZERO;
++			SetPredicate(psState, psEqInst, USC_PREDREG_NONE, IMG_FALSE);
++			InitInstArg(&psEqInst->asDest[0]);
++			psEqInst->asDest[0].uType = USEASM_REGTYPE_TEMP;
++			psEqInst->asDest[0].uNumber = GetNextRegister(psState);
++			AppendInst(psState, psCodeBlock, psEqInst);
++
++			psOrInst = AllocateInst(psState, psInst);
++			SetOpcode(psState, psOrInst, IOR);
++			SetPredicate(psState, psOrInst, uPredSrc, bPredNegate);
++			psOrInst->asDest[0] = psInst->asDest[0];
++			psOrInst->asArg[0] = psInst->asDest[0];
++			psOrInst->asArg[1] = psEqInst->asDest[0];
++			AppendInst(psState, psCodeBlock, psOrInst);
++		}
++
+ 		/* Do any destination modifiers. */
+ 		GenerateDestModF32(psState, psCodeBlock, &psInst->asDest[0], uSat, uScale, uPredSrc, bPredNegate);
+ 

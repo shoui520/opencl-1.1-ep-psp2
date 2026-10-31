@@ -1,0 +1,56 @@
+USC: flatten only conditionals whose arms reach the successor directly
+
+GetConditionalEdge stopped at an arm's first block whenever the common
+successor had two predecessors, so for an arm of several blocks it returned
+that block's edge into some other block, and CanFlattenDeltaInstructions
+read past the delta instruction's sources (float4 fmod: "uNumber <
+psState->uNumRegisters").  Follow the arm's unconditional blocks to the
+successor instead, and leave the conditional alone when an arm has flow
+control of its own.
+
+diff --git a/tools/intern/usc2/iselect.c b/tools/intern/usc2/iselect.c
+index 0457046..21028ec 100644
+--- a/tools/intern/usc2/iselect.c
++++ b/tools/intern/usc2/iselect.c
+@@ -13637,17 +13637,22 @@ IMG_UINT32 GetConditionalEdge(PCODEBLOCK psSrc, IMG_UINT32 uArm)
+ 	{
+ 		PCODEBLOCK psBlock = psSrc->asSuccs[uArm].psDest;
+ 
+-		while (psBlock->asSuccs[0].psDest != psSrc->psIPostDom)
++		/*
++			Follow the arm's unconditional blocks to the common successor; the edge
++			out of the last one is the arm's.  An arm with flow control of its own
++			has no single edge.
++		*/
++		while (psBlock->uNumSuccs == 1 && psBlock->asSuccs[0].psDest != psSrc->psIPostDom)
+ 		{
+-			if (psBlock->psIPostDom == NULL || psBlock->psIPostDom->asSuccs == NULL)
+-			{
+-				break;
+-			}
+-			if (psSrc->psIPostDom->uNumPreds != 1)
++			if (psBlock->asSuccs[0].psDest == psSrc)
+ 			{
+-				break;
++				return USC_UNDEF;
+ 			}
+-			psBlock = psBlock->psIPostDom;
++			psBlock = psBlock->asSuccs[0].psDest;
++		}
++		if (psBlock->uNumSuccs != 1)
++		{
++			return USC_UNDEF;
+ 		}
+ 
+ 		return psBlock->asSuccs[0].uDestIdx;
+@@ -15567,6 +15572,10 @@ static FLATTEN_RESULT FlattenConditional(PINTERMEDIATE_STATE psState, PCODEBLOCK
+ 			post-dominator of the conditional.
+ 		*/
+ 		auEdgeToSucc[uArm] = GetConditionalEdge(psBlock, uArm);
++		if (auEdgeToSucc[uArm] == USC_UNDEF)
++		{
++			return FLATTEN_NOCHANGE;
++		}
+ 
+ 		/*
+ 			Check if it's possible to flatten this arm of the conditional and the

@@ -467,6 +467,445 @@ static void restore_const_reads(void)
 		const_reads[--const_read_count]->eOpCode = UFOP_MOV;
 }
 
+/*
+ * The front end's float to ushort_sat conversion moves the float to a U16
+ * temporary, then fixes NaN up with a MOVCBIT selecting between that
+ * temporary and 0 into the same register, as U32: the USC refuses a register
+ * with both formats ("Using register with inconcistent formatting").  A
+ * MOVCBIT whose integer destination is one of its selected sources in a
+ * narrower integer format gets that format; restore_select_formats undoes it.
+ */
+#define MAX_SELECTS	256
+
+static struct select_save {
+	PUNIFLEX_INST inst;
+	UF_REGFORMAT fmt;
+} selects[MAX_SELECTS];
+static int select_count;
+
+static int is_narrow_int_fmt(UF_REGFORMAT fmt)
+{
+	return fmt == UF_REGFORMAT_I16 || fmt == UF_REGFORMAT_U16 ||
+	       fmt == UF_REGFORMAT_I8_UN || fmt == UF_REGFORMAT_U8_UN;
+}
+
+static void narrow_select_dests(PUNIFLEX_INST prog)
+{
+	PUNIFLEX_INST inst;
+	int k;
+
+	select_count = 0;
+	for (inst = prog; inst && select_count < MAX_SELECTS; inst = inst->psILink) {
+		if (inst->eOpCode != UFOP_MOVCBIT ||
+		    inst->sDest.eType != UFREG_TYPE_TEMP || !is_int_fmt(inst->sDest.eFormat))
+			continue;
+		for (k = 1; k <= 2; k++) {
+			const UF_REGISTER *r = &inst->asSrc[k];
+
+			if (r->eType == UFREG_TYPE_TEMP && r->uNum == inst->sDest.uNum &&
+			    r->eRelativeIndex == UFREG_RELATIVEINDEX_NONE && is_narrow_int_fmt(r->eFormat)) {
+				selects[select_count].inst = inst;
+				selects[select_count++].fmt = inst->sDest.eFormat;
+				inst->sDest.eFormat = r->eFormat;
+				break;
+			}
+		}
+	}
+}
+
+static void restore_select_formats(void)
+{
+	while (select_count > 0) {
+		select_count--;
+		selects[select_count].inst->sDest.eFormat = selects[select_count].fmt;
+	}
+}
+
+static int is_block_open(UF_OPCODE op)
+{
+	switch (op) {
+	case UFOP_IF: case UFOP_IFC: case UFOP_IFP: case UFOP_IFNZBIT: case UFOP_ELSE:
+	case UFOP_LOOP: case UFOP_REP: case UFOP_GLSLLOOP: case UFOP_GLSLSTATICLOOP:
+	case UFOP_LABEL: case UFOP_SWITCH:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static int is_block_close(UF_OPCODE op)
+{
+	switch (op) {
+	case UFOP_ENDIF: case UFOP_ELSE: case UFOP_ENDLOOP: case UFOP_ENDREP:
+	case UFOP_GLSLENDLOOP: case UFOP_RET: case UFOP_ENDSWITCH:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+/*
+ * For x % y on 8 or 16-bit integers the front end extends both operands to
+ * U32 or I32, divides with a DIV2 in that format, then reads the result in
+ * the narrow one: a register with two formats again.  The remainder is
+ * smaller in magnitude than the divisor, so it reads the same in the wide
+ * format; such a read gets that format back.  Only a DIV2 earlier in the
+ * same block, both of whose operands are MOVs there from the format read,
+ * counts.
+ * restore_div2_reads undoes it.
+ */
+#define MAX_DIV2_READS	256
+
+static UF_REGISTER *div2_reads[MAX_DIV2_READS];
+static UF_REGFORMAT div2_read_fmts[MAX_DIV2_READS];
+static int div2_read_count;
+
+static UF_REGFORMAT wide_fmt(UF_REGFORMAT fmt)
+{
+	return fmt == UF_REGFORMAT_I16 || fmt == UF_REGFORMAT_I8_UN ? UF_REGFORMAT_I32 : UF_REGFORMAT_U32;
+}
+
+/* the format a temporary is an extending MOV from, or INVALID */
+static UF_REGFORMAT extended_from(PUNIFLEX_INST const *defs, IMG_UINT32 count, const UF_REGISTER *r)
+{
+	PUNIFLEX_INST def;
+
+	if (r->eType != UFREG_TYPE_TEMP || r->eRelativeIndex != UFREG_RELATIVEINDEX_NONE ||
+	    r->uNum >= count || r->byMod != 0)
+		return UF_REGFORMAT_INVALID;
+	def = defs[r->uNum];
+	if (!def || def->eOpCode != UFOP_MOV || def->uPredicate != UF_PRED_NONE ||
+	    def->sDest.byMod != 0 || def->asSrc[0].byMod != 0 ||
+	    !is_narrow_int_fmt(def->asSrc[0].eFormat) || def->sDest.eFormat != wide_fmt(def->asSrc[0].eFormat))
+		return UF_REGFORMAT_INVALID;
+	return def->asSrc[0].eFormat;
+}
+
+static void widen_div2_reads(PUNIFLEX_INST prog)
+{
+	PUNIFLEX_INST inst;
+	/* per temporary: its definition in this block, and for a DIV2 from
+	 * operands zero-extended from one format, that format */
+	PUNIFLEX_INST *defs;
+	UF_REGFORMAT *narrow;
+	IMG_UINT32 count = 0, i, k;
+
+	div2_read_count = 0;
+	for (inst = prog; inst; inst = inst->psILink) {
+		if (inst->sDest.eType == UFREG_TYPE_TEMP && inst->sDest.uNum + dest_regs(inst) > count)
+			count = inst->sDest.uNum + dest_regs(inst);
+		if (inst->sDest2.eType == UFREG_TYPE_TEMP && inst->sDest2.uNum >= count)
+			count = inst->sDest2.uNum + 1;
+	}
+	defs = calloc(count + 1, sizeof(*defs));
+	narrow = malloc((count + 1) * sizeof(*narrow));
+	if (!defs || !narrow) {
+		free(defs);
+		free(narrow);
+		return;
+	}
+	for (i = 0; i <= count; i++)
+		narrow[i] = UF_REGFORMAT_INVALID;
+	for (inst = prog; inst && div2_read_count < MAX_DIV2_READS; inst = inst->psILink) {
+		PCINPUT_INST_DESC desc = PVRUniFlexGetInputInstDesc(inst->eOpCode);
+		UF_REGFORMAT fmt = UF_REGFORMAT_INVALID;
+
+		if (!desc || is_block_open(inst->eOpCode) || is_block_close(inst->eOpCode) ||
+		    inst->eOpCode == UFOP_BLOCK || inst->eOpCode == UFOP_JUMP) {
+			memset(defs, 0, (count + 1) * sizeof(*defs));
+			continue;
+		}
+		for (i = 0; i < desc->uNumSrcArgs && i < UNIFLEX_MAXIMUM_SOURCE_ARGUMENT_COUNT &&
+			    div2_read_count < MAX_DIV2_READS; i++) {
+			UF_REGISTER *r = &inst->asSrc[i];
+
+			if (r->eType != UFREG_TYPE_TEMP || r->eRelativeIndex != UFREG_RELATIVEINDEX_NONE ||
+			    r->uNum >= count || !defs[r->uNum] || defs[r->uNum]->eOpCode != UFOP_DIV2 ||
+			    !is_narrow_int_fmt(r->eFormat) || narrow[r->uNum] != r->eFormat)
+				continue;
+			div2_reads[div2_read_count] = r;
+			div2_read_fmts[div2_read_count++] = r->eFormat;
+			r->eFormat = wide_fmt(r->eFormat);
+		}
+		if (inst->eOpCode == UFOP_DIV2 && inst->uPredicate == UF_PRED_NONE &&
+		    extended_from(defs, count, &inst->asSrc[0]) == extended_from(defs, count, &inst->asSrc[1])) {
+			fmt = extended_from(defs, count, &inst->asSrc[0]);
+			if (inst->sDest.eFormat != wide_fmt(fmt) || inst->sDest2.eFormat != wide_fmt(fmt))
+				fmt = UF_REGFORMAT_INVALID;
+		}
+		if (desc->uNumDests >= 1 && inst->sDest.eType == UFREG_TYPE_TEMP)
+			for (k = 0; k < dest_regs(inst); k++) {
+				defs[inst->sDest.uNum + k] = inst;
+				narrow[inst->sDest.uNum + k] = fmt;
+			}
+		if (desc->uNumDests >= 2 && inst->sDest2.eType == UFREG_TYPE_TEMP) {
+			defs[inst->sDest2.uNum] = inst;
+			narrow[inst->sDest2.uNum] = fmt;
+		}
+	}
+	free(defs);
+	free(narrow);
+}
+
+static void restore_div2_reads(void)
+{
+	while (div2_read_count > 0) {
+		div2_read_count--;
+		div2_reads[div2_read_count]->eFormat = div2_read_fmts[div2_read_count];
+	}
+}
+
+/*
+ * A float SETB subtracts its sources and tests the difference against zero,
+ * so it gets equal infinities wrong (their difference is NaN): only < is
+ * right for every pair, false with a NaN.  And the front end lowers each
+ * unordered comparison as the ordered one, so none is true for a NaN:
+ * if (a >= b) (lowered as !(a < b), LLVM's ult, a SETBLT) is taken for one.
+ * tools/oclc/patch_frontend.py has the front end emit the opcodes below for
+ * the unordered comparisons (and ordered !=) instead, on the operands it
+ * would give the ordered SETB.  Those and float SETBGE, SETBEQ and SETBNE
+ * become, from l = x < y, g = y < x and o = |x| >= 0 & |y| >= 0 (ordered:
+ * |x| - 0 is NaN only for a NaN):
+ *	x >= y		!l & o		ult(x, y)	l | !o
+ *	x == y		!(l | g) & o	uge(x, y)	!l
+ *	x != y		l | g | !o	ueq(x, y)	!(l | g)
+ *					one(x, y)	l | g
+ * Except: IMG's == (a library function) tests x * x for a NaN with
+ * uge(x * x, 0), which the ordered lowering made false for one; that stays
+ * ordered.  restore_compares undoes it all.
+ */
+#define UFOP_SHIM_SETBULT	((UF_OPCODE)0xF0)
+#define UFOP_SHIM_SETBUGE	((UF_OPCODE)0xF1)
+#define UFOP_SHIM_SETBUEQ	((UF_OPCODE)0xF2)
+#define UFOP_SHIM_SETBONE	((UF_OPCODE)0xF3)
+#define MAX_COMPARES		1024
+
+static struct compare_save {
+	PUNIFLEX_INST inst, last;
+	UNIFLEX_INST orig;
+} compares[MAX_COMPARES];
+static int compare_count;
+
+static const char *shim_opcode_name(UF_OPCODE op)
+{
+	switch ((int)op) {
+	case UFOP_SHIM_SETBULT: return "SETBULT";
+	case UFOP_SHIM_SETBUGE: return "SETBUGE";
+	case UFOP_SHIM_SETBUEQ: return "SETBUEQ";
+	case UFOP_SHIM_SETBONE: return "SETBONE";
+	default: return NULL;
+	}
+}
+
+/* USC compares as its destination's format: an integer one compares bits */
+static int is_f32_setb(const UNIFLEX_INST *inst)
+{
+	return (inst->eOpCode == UFOP_SETBGE || inst->eOpCode == UFOP_SETBEQ ||
+		inst->eOpCode == UFOP_SETBNE) && inst->sDest.eFormat == UF_REGFORMAT_F32 &&
+	       inst->asSrc[0].eFormat == UF_REGFORMAT_F32 && inst->asSrc[1].eFormat == UF_REGFORMAT_F32;
+}
+
+/* whether every channel r reads is a static 0 */
+static int is_zero(const UF_REGISTER *r, PUNIFLEX_CONSTDEF consts)
+{
+	IMG_UINT32 k;
+
+	if (r->byMod)
+		return 0;
+	if (r->eType == UFREG_TYPE_IMMEDIATE)
+		return r->uNum == 0;
+	if (r->eType != UFREG_TYPE_CONST || r->eRelativeIndex != UFREG_RELATIVEINDEX_NONE || !consts)
+		return 0;
+	for (k = 0; k < 4; k++) {
+		IMG_UINT32 sw = (r->u.uSwiz >> (3 * k)) & 7, i = r->uNum * 4 + sw;
+
+		if (sw == UFREG_SWIZ_0)
+			continue;
+		if (sw > UFREG_SWIZ_A || i >= consts->uCount ||
+		    !(consts->puConstStaticFlags[i / 32] & (1u << (i % 32))) ||
+		    ((const IMG_UINT32 *)consts->pfConst)[i] != 0)
+			return 0;
+	}
+	return 1;
+}
+
+static int same_reg(const UF_REGISTER *a, const UF_REGISTER *b)
+{
+	return a->eType == b->eType && a->uNum == b->uNum && a->u.uSwiz == b->u.uSwiz &&
+	       a->byMod == b->byMod && a->eRelativeIndex == UFREG_RELATIVEINDEX_NONE &&
+	       b->eRelativeIndex == UFREG_RELATIVEINDEX_NONE;
+}
+
+/* the comparison's sequence: the first instruction is the comparison itself */
+struct compare_seq {
+	PUNIFLEX_INST inst, last;
+	UF_REGISTER like;	/* its destination, for the temporaries */
+	IMG_UINT32 *next;	/* the next free temporary */
+};
+
+static UF_REGISTER seq_emit(struct compare_seq *q, UF_OPCODE op, const UF_REGISTER *a,
+			    const UF_REGISTER *b)
+{
+	UF_REGISTER t = q->like, r;
+
+	t.uNum = (*q->next)++;
+	t.eType = UFREG_TYPE_TEMP;
+	t.byMod = 0;
+	t.eRelativeIndex = UFREG_RELATIVEINDEX_NONE;
+	t.uArrayTag = 0;
+	if (!q->last) {
+		q->inst->eOpCode = op;
+		q->inst->sDest = t;
+		q->inst->asSrc[0] = *a;
+		if (b)
+			q->inst->asSrc[1] = *b;
+		q->inst->uPredicate = UF_PRED_NONE;
+		q->last = q->inst;
+	} else {
+		PUNIFLEX_INST inst = calloc(1, sizeof(*inst));
+
+		if (!inst)
+			abort();
+		inst->eOpCode = op;
+		inst->sDest = t;
+		inst->asSrc[0] = *a;
+		if (b)
+			inst->asSrc[1] = *b;
+		inst->uPredicate = UF_PRED_NONE;
+		inst->psILink = q->last->psILink;
+		q->last->psILink = inst;
+		q->last = inst;
+	}
+	r = t;
+	r.u.uSwiz = UFREG_SWIZ_NONE;
+	return r;
+}
+
+/* |r| >= 0: whether r isn't a NaN */
+static UF_REGISTER seq_ordered(struct compare_seq *q, const UF_REGISTER *r)
+{
+	UF_REGISTER a = *r, zero;
+
+	a.byMod = (a.byMod & ~UFREG_SOURCE_NEGATE) | UFREG_SOURCE_ABS;
+	set_reg(&zero, UFREG_TYPE_IMMEDIATE, 0, UF_REGFORMAT_F32);
+	return seq_emit(q, UFOP_SETBGE, &a, &zero);
+}
+
+static void expand_compares(PUNIFLEX_INST prog, PUNIFLEX_CONSTDEF consts)
+{
+	PUNIFLEX_INST inst, *defs;
+	IMG_UINT32 next = 0, count, i;
+
+	compare_count = 0;
+	for (inst = prog; inst; inst = inst->psILink) {
+		if (inst->sDest.eType == UFREG_TYPE_TEMP && inst->sDest.uNum + dest_regs(inst) > next)
+			next = inst->sDest.uNum + dest_regs(inst);
+		if (inst->sDest2.eType == UFREG_TYPE_TEMP && inst->sDest2.uNum >= next)
+			next = inst->sDest2.uNum + 1;
+		for (i = 0; i < UNIFLEX_MAXIMUM_SOURCE_ARGUMENT_COUNT; i++)
+			if (inst->asSrc[i].eType == UFREG_TYPE_TEMP && inst->asSrc[i].uNum >= next)
+				next = inst->asSrc[i].uNum + 1;
+	}
+	/* each temporary's definition earlier in the block */
+	count = next;
+	defs = calloc(count + 1, sizeof(*defs));
+	if (!defs)
+		abort();
+	for (inst = prog; inst; inst = inst->psILink) {
+		struct compare_seq q;
+		struct compare_save *s;
+		UF_REGISTER x, y, l, g, o, e, d;
+		UF_OPCODE op = inst->eOpCode;
+
+		if (is_block_open(op) || is_block_close(op) || op == UFOP_BLOCK || op == UFOP_JUMP ||
+		    op == UFOP_CALL) {
+			memset(defs, 0, (count + 1) * sizeof(*defs));
+			continue;
+		}
+		if (!shim_opcode_name(op) && !is_f32_setb(inst)) {
+			if (inst->sDest.eType == UFREG_TYPE_TEMP && inst->sDest.uNum < count)
+				defs[inst->sDest.uNum] = inst;
+			continue;
+		}
+		x = inst->asSrc[0];
+		y = inst->asSrc[1];
+		/* IMG's NaN test, uge(x * x, 0): ordered */
+		if (op == UFOP_SHIM_SETBUGE && x.eType == UFREG_TYPE_TEMP && x.uNum < count &&
+		    x.eRelativeIndex == UFREG_RELATIVEINDEX_NONE && !x.byMod && defs[x.uNum] &&
+		    defs[x.uNum]->eOpCode == UFOP_MUL && same_reg(&defs[x.uNum]->asSrc[0], &defs[x.uNum]->asSrc[1]) &&
+		    is_zero(&y, consts))
+			op = UFOP_SETBGE;
+		if (compare_count == MAX_COMPARES) {
+			fprintf(stderr, "usc_shim: too many float comparisons\n");
+			abort();
+		}
+		s = &compares[compare_count++];
+		s->inst = inst;
+		s->orig = *inst;
+		q.inst = inst;
+		q.last = NULL;
+		q.like = inst->sDest;
+		q.next = &next;
+		l = seq_emit(&q, UFOP_SETBLT, &x, &y);
+		if (op == UFOP_SETBEQ || op == UFOP_SETBNE || op == UFOP_SHIM_SETBUEQ || op == UFOP_SHIM_SETBONE) {
+			g = seq_emit(&q, UFOP_SETBLT, &y, &x);
+			e = seq_emit(&q, UFOP_OR, &l, &g);
+		}
+		if (op == UFOP_SETBGE || op == UFOP_SETBEQ || op == UFOP_SETBNE || op == UFOP_SHIM_SETBULT) {
+			UF_REGISTER ox = seq_ordered(&q, &x), oy = seq_ordered(&q, &y);
+
+			o = seq_emit(&q, UFOP_AND, &ox, &oy);
+		}
+		switch ((int)op) {
+		case UFOP_SETBGE:
+			d = seq_emit(&q, UFOP_NOT, &l, NULL);
+			seq_emit(&q, UFOP_AND, &d, &o);
+			break;
+		case UFOP_SETBEQ:
+			d = seq_emit(&q, UFOP_NOT, &e, NULL);
+			seq_emit(&q, UFOP_AND, &d, &o);
+			break;
+		case UFOP_SETBNE:
+			d = seq_emit(&q, UFOP_NOT, &o, NULL);
+			seq_emit(&q, UFOP_OR, &e, &d);
+			break;
+		case UFOP_SHIM_SETBULT:
+			d = seq_emit(&q, UFOP_NOT, &o, NULL);
+			seq_emit(&q, UFOP_OR, &l, &d);
+			break;
+		case UFOP_SHIM_SETBUGE:
+			seq_emit(&q, UFOP_NOT, &l, NULL);
+			break;
+		case UFOP_SHIM_SETBUEQ:
+			seq_emit(&q, UFOP_NOT, &e, NULL);
+			break;
+		}
+		/* the last one writes the destination as the comparison did
+		   (one(x, y) is l | g, already last) */
+		q.last->sDest = s->orig.sDest;
+		q.last->uPredicate = s->orig.uPredicate;
+		s->last = q.last;
+		if (s->orig.sDest.eType == UFREG_TYPE_TEMP && s->orig.sDest.uNum < count)
+			defs[s->orig.sDest.uNum] = q.last;
+		inst = q.last;
+	}
+	free(defs);
+}
+
+static void restore_compares(void)
+{
+	while (compare_count > 0) {
+		struct compare_save *s = &compares[--compare_count];
+		PUNIFLEX_INST inst, next;
+
+		for (inst = s->inst->psILink; inst; inst = next) {
+			next = inst == s->last ? NULL : inst->psILink;
+			free(inst);
+		}
+		*s->inst = s->orig;
+	}
+}
+
 /* Take the instructions first..last back out of the program and free them;
  * returns the program. */
 static PUNIFLEX_INST unlink_added(PUNIFLEX_INST prog, PUNIFLEX_INST first, PUNIFLEX_INST last)
@@ -635,29 +1074,6 @@ static IMG_UINT32 params_unknown_flags(IMG_UINT32 flags)
 	return flags & 0xC0000000U;
 }
 
-static int is_block_open(UF_OPCODE op)
-{
-	switch (op) {
-	case UFOP_IF: case UFOP_IFC: case UFOP_IFP: case UFOP_IFNZBIT: case UFOP_ELSE:
-	case UFOP_LOOP: case UFOP_REP: case UFOP_GLSLLOOP: case UFOP_GLSLSTATICLOOP:
-	case UFOP_LABEL: case UFOP_SWITCH:
-		return 1;
-	default:
-		return 0;
-	}
-}
-
-static int is_block_close(UF_OPCODE op)
-{
-	switch (op) {
-	case UFOP_ENDIF: case UFOP_ELSE: case UFOP_ENDLOOP: case UFOP_ENDREP:
-	case UFOP_GLSLENDLOOP: case UFOP_RET: case UFOP_ENDSWITCH:
-		return 1;
-	default:
-		return 0;
-	}
-}
-
 static void dump_program(const char *prefix, int n, IMG_UINT32 flags, PUNIFLEX_INST insts,
 			 PUNIFLEX_CONSTDEF consts, const void *params, size_t params_size)
 {
@@ -694,8 +1110,17 @@ static void dump_program(const char *prefix, int n, IMG_UINT32 flags, PUNIFLEX_I
 		if (is_block_close(inst->eOpCode) && indent > 0)
 			indent--;
 		line[0] = 0;
-		PVRUniFlexDecodeInputInst(inst, indent, line, &texmask);
-		fprintf(f, "%s\n", line);
+		if (shim_opcode_name(inst->eOpCode)) {
+			/* USC can't decode the front end's (patched) unordered comparisons */
+			UNIFLEX_INST copy = *inst;
+
+			copy.eOpCode = UFOP_SETBLT;
+			PVRUniFlexDecodeInputInst(&copy, indent, line, &texmask);
+			fprintf(f, "%s\t; %s\n", line, shim_opcode_name(inst->eOpCode));
+		} else {
+			PVRUniFlexDecodeInputInst(inst, indent, line, &texmask);
+			fprintf(f, "%s\n", line);
+		}
 		if (raw) {
 			int a;
 
@@ -759,6 +1184,7 @@ IMG_UINT32 IMG_CALLCONV PVRUniFlexCompileToUspBin(IMG_PVOID pvContext, IMG_UINT3
 	if (prefix)
 		dump_program(prefix, n, *pui32Flags, psSWProc, psConstants, psProgramParameters, PARAMS_IMG_SIZE);
 
+	expand_compares(psSWProc, psConstants);
 	if (use_img()) {
 		err = img.compile(pvContext, pui32Flags, psSWProc, psConstants, psProgramParameters, ppsPCShader);
 	} else {
@@ -792,8 +1218,11 @@ IMG_UINT32 IMG_CALLCONV PVRUniFlexCompileToUspBin(IMG_PVOID pvContext, IMG_UINT3
 		}
 		reinterpret_const_reads(psSWProc);
 		order_phi_copies(psSWProc);
+		narrow_select_dests(psSWProc);
+		widen_div2_reads(psSWProc);
 		psSWProc = zero_unwritten_temps(psSWProc, zeros);
-		if (prefix && (gxm || zeros[0] || phi_save_count || const_read_count))
+		if (prefix && (gxm || zeros[0] || phi_save_count || const_read_count || select_count ||
+			       div2_read_count || compare_count))
 			dump_program(prefix, n + 1000, *pui32Flags, psSWProc, psConstants, &params, sizeof(params));
 		err = psp2_PVRUniFlexCompileToUspBin(pvContext, pui32Flags, psSWProc, psConstants, &params,
 						     ppsPCShader);
@@ -804,7 +1233,10 @@ IMG_UINT32 IMG_CALLCONV PVRUniFlexCompileToUspBin(IMG_PVOID pvContext, IMG_UINT3
 			psSWProc = unlink_added(psSWProc, added[0], added[1]);
 		restore_phi_copies();
 		restore_const_reads();
+		restore_select_formats();
+		restore_div2_reads();
 	}
+	restore_compares();
 	if (!err && n < MAX_PROGRAMS)
 		programs[n] = *ppsPCShader;
 	if (prefix && !err && *ppsPCShader) {

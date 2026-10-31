@@ -1,0 +1,58 @@
+USC: REINTERP between integer formats of the same width
+
+The front end makes OpenCL's as_type between a float and a vector of 8 or
+16-bit integers (as_ushort2(float), as_float2(short4), ...) from REINTERPs
+of e.g. U16 to I16, which ExpandREINTERP only had for a float and a 32-bit
+integer ("(eDestFormat == UF_REGFORMAT_F32) || ...").  Between integer
+formats of one width it's a copy.
+
+diff --git a/tools/intern/usc2/icvt_core.c b/tools/intern/usc2/icvt_core.c
+index 21b9a29..2981ff5 100644
+--- a/tools/intern/usc2/icvt_core.c
++++ b/tools/intern/usc2/icvt_core.c
+@@ -12886,6 +12886,29 @@ static IMG_VOID ExpandMOV(PINTERMEDIATE_STATE psState, PUNIFLEX_INST psOrigInst,
+ 	}
+ }
+ 
++static IMG_UINT32 IntegerFormatWidth(UF_REGFORMAT eFormat)
++/*****************************************************************************
++ FUNCTION	: IntegerFormatWidth
++
++ PURPOSE	: Get the width of an integer register format.
++
++ PARAMETERS	: eFormat			- Format.
++
++ RETURNS	: The width in bits, or 0 if the format isn't an integer one.
++*****************************************************************************/
++{
++	switch (eFormat)
++	{
++		case UF_REGFORMAT_I32:
++		case UF_REGFORMAT_U32: return 32;
++		case UF_REGFORMAT_I16:
++		case UF_REGFORMAT_U16: return 16;
++		case UF_REGFORMAT_I8_UN:
++		case UF_REGFORMAT_U8_UN: return 8;
++		default: return 0;
++	}
++}
++
+ static IMG_VOID ExpandREINTERP(PINTERMEDIATE_STATE psState, PUNIFLEX_INST psOrigInst, PINPUT_PROGRAM psProg)
+ /*****************************************************************************
+  FUNCTION	: ExpandREINTERP
+@@ -12911,6 +12934,15 @@ static IMG_VOID ExpandREINTERP(PINTERMEDIATE_STATE psState, PUNIFLEX_INST psOrig
+ 	psMOVInst->sDest = psOrigInst->sDest;
+ 	psMOVInst->asSrc[0] = psOrigInst->asSrc[0];
+ 	psMOVInst->uPredicate = psOrigInst->uPredicate;
++	if (IntegerFormatWidth(eDestFormat) != 0 && IntegerFormatWidth(eDestFormat) == IntegerFormatWidth(eSourceFormat))
++	{
++		/*
++			Between integer formats of the same width (e.g. OpenCL's as_short2 of
++			a float, through ushort): a copy.
++		*/
++		psMOVInst->asSrc[0].eFormat = psMOVInst->sDest.eFormat;
++		return;
++	}
+ 	if	(
+ 			eDestFormat == UF_REGFORMAT_U32 ||
+ 			eDestFormat == UF_REGFORMAT_I32

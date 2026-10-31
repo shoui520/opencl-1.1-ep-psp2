@@ -1,0 +1,29 @@
+USC: precision of 8-bit integer test masks
+
+On vec34 cores GenerateInt8Comparison makes its TESTMASK with an 8-bit ALU
+(ISUB8/ISUBU8) and a precision mask, but ConvertTESTToUseasm only gave the
+32 and 16-bit ALUs their precision flag, so any comparison of char or uchar
+failed to assemble ("For a isub8 instruction with test and the .msk flag
+either .i8 or .i10 flags must be present").  The 8-bit ALUs get .i8.
+
+diff --git a/tools/intern/usc2/asm.c b/tools/intern/usc2/asm.c
+index faed7a1..f8aee07 100644
+--- a/tools/intern/usc2/asm.c
++++ b/tools/intern/usc2/asm.c
+@@ -5300,6 +5300,16 @@ static IMG_VOID ConvertTESTToUseasm(PINTERMEDIATE_STATE psState, PINST psIn, PUS
+ 					psOut->uFlags2 |= USEASM_OPFLAGS2_MOVC_FMTI16;
+ 					break;
+ 				}
++
++				case USEASM_OP_IADD8:
++				case USEASM_OP_IADDU8:
++				case USEASM_OP_ISUB8:
++				case USEASM_OP_ISUBU8:
++				{
++					/* A byte per channel (GenerateInt8Comparison). */
++					psOut->uFlags1 |= USEASM_OPFLAGS1_MOVC_FMTI8;
++					break;
++				}
+ 	
+ 				default: 
+ 				{

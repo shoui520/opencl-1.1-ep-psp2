@@ -1,0 +1,121 @@
+USC: 16-bit selects on vec34
+
+A MOVC testing a 16-bit integer was IMOVC_I16, which only the scalar cores
+have: on SGX543 the assembler refused it ("The movc instruction isn't
+supported on this core"), e.g. in fma, ldexp and the float4 fmax(x, s).
+AppendMovcI16 shifts the test source into the upper half and tests it with
+the 32-bit MOVC there, which keeps the sign and zero tests.  It's used for
+16-bit min/max, abs and MOVCBIT.
+
+diff --git a/tools/intern/usc2/icvt_f32.c b/tools/intern/usc2/icvt_f32.c
+index f1bf43c..120eda9 100644
+--- a/tools/intern/usc2/icvt_f32.c
++++ b/tools/intern/usc2/icvt_f32.c
+@@ -2870,7 +2870,14 @@ IMG_VOID ConvertComparisonInstructionF32(PINTERMEDIATE_STATE psState, PCODEBLOCK
+ 			pfnGetDest(psState, psCodeBlock, &psSrc->sDest, i, &psInst->asDest[0]);
+ 		}
+ 
+-		AppendInst(psState, psCodeBlock, psInst);
++		if (psInst->eOpcode == IMOVC_I16)
++		{
++			AppendMovcI16(psState, psCodeBlock, psInst);
++		}
++		else
++		{
++			AppendInst(psState, psCodeBlock, psInst);
++		}
+ 
+ 		/* Do any destination modifiers. */
+ 		GenerateDestModF32(psState, 
+diff --git a/tools/intern/usc2/icvt_i32.c b/tools/intern/usc2/icvt_i32.c
+index 0a24ac4..ba66013 100644
+--- a/tools/intern/usc2/icvt_i32.c
++++ b/tools/intern/usc2/icvt_i32.c
+@@ -3204,7 +3204,7 @@ IMG_VOID ConvertMinMaxInstructionInt16(PINTERMEDIATE_STATE	psState,
+ 	psMovcInst->asArg[2] = *psArgB;
+ 	
+ 	/* has already been predicated and had destination set. */
+-	AppendInst(psState, psCodeBlock, psMovcInst);
++	AppendMovcI16(psState, psCodeBlock, psMovcInst);
+ 
+ }
+ 
+@@ -4682,7 +4682,14 @@ IMG_VOID IntegerAbsoluteFmt(PINTERMEDIATE_STATE psState,
+ 	psMovcInst->asArg[0] = *psSrc;
+ 	psMovcInst->asArg[1] = sNegatedSrc;
+ 	psMovcInst->asArg[2] = *psSrc;
+-	AppendInst(psState, psBlock, psMovcInst);
++	if (eOpCode == IMOVC_I16)
++	{
++		AppendMovcI16(psState, psBlock, psMovcInst);
++	}
++	else
++	{
++		AppendInst(psState, psBlock, psMovcInst);
++	}
+ 
+ 	/*
+ 		Return the register containing the absolute value of psSrc.
+@@ -4690,6 +4697,50 @@ IMG_VOID IntegerAbsoluteFmt(PINTERMEDIATE_STATE psState,
+ 	*psResult = psMovcInst->asDest[0];
+ }
+ 
++IMG_INTERNAL
++IMG_VOID AppendMovcI16(PINTERMEDIATE_STATE psState, PCODEBLOCK psBlock, PINST psMovcInst)
++/*****************************************************************************
++ FUNCTION	: AppendMovcI16
++
++ PURPOSE	: Append a MOVC testing a 16-bit integer.  A vector core has no 16-bit
++			  MOVC, so there the test source is shifted into the upper half and
++			  tested with the 32-bit MOVC: its sign and whether it's zero are the
++			  16-bit value's.
++
++ PARAMETERS	: psState			- Compiler state.
++			  psBlock			- Block to append to.
++			  psMovcInst		- IMOVC_I16 instruction, with its arguments set.
++
++ RETURNS	: Nothing.
++*****************************************************************************/
++{
++	#if defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554)
++	if ((psState->psTargetFeatures->ui32Flags & SGX_FEATURE_FLAGS_USE_VEC34) != 0)
++	{
++		PINST	psShlInst;
++		ARG		sHigh;
++
++		InitInstArg(&sHigh);
++		sHigh.uType = USEASM_REGTYPE_TEMP;
++		sHigh.uNumber = GetNextRegister(psState);
++		sHigh.eFmt = UF_REGFORMAT_F32;
++
++		psShlInst = AllocateInst(psState, psMovcInst);
++		SetOpcode(psState, psShlInst, ISHL);
++		psShlInst->asDest[0] = sHigh;
++		psShlInst->asArg[BITWISE_SHIFTEND_SOURCE] = psMovcInst->asArg[0];
++		psShlInst->asArg[BITWISE_SHIFT_SOURCE].uType = USEASM_REGTYPE_IMMEDIATE;
++		psShlInst->asArg[BITWISE_SHIFT_SOURCE].uNumber = 16;
++		psShlInst->asArg[BITWISE_SHIFT_SOURCE].eFmt = UF_REGFORMAT_F32;
++		AppendInst(psState, psBlock, psShlInst);
++
++		psMovcInst->asArg[0] = sHigh;
++		ModifyOpcode(psState, psMovcInst, IMOVC_I32);
++	}
++	#endif /* defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554) */
++	AppendInst(psState, psBlock, psMovcInst);
++}
++
+ IMG_INTERNAL
+ IMG_VOID ZeroExtendInteger(PINTERMEDIATE_STATE	psState,
+ 						   PCODEBLOCK			psCodeBlock,
+diff --git a/tools/intern/usc2/uscshrd.h b/tools/intern/usc2/uscshrd.h
+index b4121ac..103e1ae 100644
+--- a/tools/intern/usc2/uscshrd.h
++++ b/tools/intern/usc2/uscshrd.h
+@@ -4275,6 +4275,7 @@ PCODEBLOCK ConvertInstToIntermediateInt32(PINTERMEDIATE_STATE psState,
+ 										  PUNIFLEX_INST psSrc,
+ 										  IMG_BOOL bConditional,
+ 										  IMG_BOOL bStaticCond);
++IMG_VOID AppendMovcI16(PINTERMEDIATE_STATE psState, PCODEBLOCK psBlock, PINST psMovcInst);
+ IMG_VOID IntegerNegate(PINTERMEDIATE_STATE		psState,
+ 					   PCODEBLOCK				psCodeBlock,
+ 					   PINST					psInsertInstBefore,

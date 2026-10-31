@@ -1,0 +1,153 @@
+USC: don't combine memory loads into a fetch across a store
+
+BuildFetchInstructions groups loads from consecutive addresses in a block
+into one fetch at the position of the earliest, however far apart they are,
+so a load after a store moved before it and read the old memory: after
+copying into local memory, then copying over part of it and copying it out
+again, the copy out took the first element from the earlier fetch.  Only
+combine two loads if no store which may write the later one's memory (or a
+lock, release or synchronised load) is between them.  The alias check is
+dgraph.c's, made public.
+
+diff --git a/tools/intern/usc2/dgraph.c b/tools/intern/usc2/dgraph.c
+--- a/tools/intern/usc2/dgraph.c
++++ b/tools/intern/usc2/dgraph.c
+@@ -1648,10 +1648,10 @@
+ 	return IMG_TRUE;
+ }
+ 
+-static
+-IMG_BOOL MemAccessesMayAlias(PMEMACCESS_DATA psEarlier, PINST psLater)
++IMG_INTERNAL
++IMG_BOOL MemoryAccessesMayAlias(PINST psInst, IMG_BOOL bAddressRegChanged, PINST psLater)
+ /*********************************************************************************
+- Function			: MemAccessesMayAlias
++ Function			: MemoryAccessesMayAlias
+ 
+  Description		: Check if two absolute addressed loads or stores might access
+ 					  the same memory.  They don't if:
+@@ -1661,13 +1661,14 @@
+ 					     don't overlap.
+ 					  3) They're to different (known) memory address spaces.
+ 
+- Parameters			: psEarlier		- The earlier load or store.
+-					  psLater		- The later one.
++ Parameters			: psInst				- The earlier load or store.
++					  bAddressRegChanged	- Whether its base address register is
++											  written before the later one.
++					  psLater				- The later one.
+ 
+  Return				: TRUE if they might.
+ *********************************************************************************/
+ {
+-	PINST psInst = psEarlier->psInst;
+ 	IMG_UINT32 uFlags, uLaterFlags, uLowest, uHighest, uLaterLowest, uLaterHighest;
+ 	IMG_BOOL bRange = GetMemAccessRange(psInst, &uFlags, &uLowest, &uHighest);
+ 	IMG_BOOL bLaterRange = GetMemAccessRange(psLater, &uLaterFlags, &uLaterLowest, &uLaterHighest);
+@@ -1679,7 +1680,7 @@
+ 	{
+ 		return IMG_FALSE;
+ 	}
+-	if (bSameBase && !psEarlier->bAddressRegChanged && bRange && bLaterRange &&
++	if (bSameBase && !bAddressRegChanged && bRange && bLaterRange &&
+ 		(uHighest < uLaterLowest || uLaterHighest < uLowest))
+ 	{
+ 		return IMG_FALSE;
+@@ -1731,7 +1732,7 @@
+ 				for (psEntry = psList->psHead; psEntry != NULL; psEntry = psEntry->psNext)
+ 				{
+ 					psData = IMG_CONTAINING_RECORD (psEntry, PMEMACCESS_DATA, sListEntry);
+-					if (MemAccessesMayAlias(psData, psInst))
++					if (MemoryAccessesMayAlias(psData->psInst, psData->bAddressRegChanged, psInst))
+ 					{
+ 						AddDependency(psDepState, psData->uInst, uInst);
+ 					}
+diff --git a/tools/intern/usc2/reorder.c b/tools/intern/usc2/reorder.c
+--- a/tools/intern/usc2/reorder.c
++++ b/tools/intern/usc2/reorder.c
+@@ -150,6 +150,58 @@
+ 	return (IMG_INT32)(psInst1->uBlockIndex - psInst2->uBlockIndex);
+ }
+ 
++static IMG_BOOL IsMemoryWriteBetween(PINST psBaseInst, PINST psNextInst)
++/*****************************************************************************
++ FUNCTION	: IsMemoryWriteBetween
++
++ PURPOSE	: Check if a store, lock, release or synchronised load between two
++			  memory loads in the same basic block could change the memory read
++			  by whichever of them is later, which a fetch combining them would
++			  read at the position of the earlier one.
++
++ PARAMETERS	: psBaseInst		- The first load in the fetch (with the
++								  loads already combined into it).
++			  psNextInst		- The load to add to the fetch.
++
++ RETURNS	: TRUE if there is one.
++*****************************************************************************/
++{
++	PINST		psInst;
++	PINST		psFirst = psBaseInst;
++	PINST		psLast = psNextInst;
++	IMG_BOOL	bBaseMoves = IMG_FALSE;
++
++	if (psNextInst->uBlockIndex < psBaseInst->uBlockIndex)
++	{
++		psFirst = psNextInst;
++		psLast = psBaseInst;
++		bBaseMoves = IMG_TRUE;
++	}
++	for (psInst = psFirst->psNext; psInst != NULL && psInst != psLast; psInst = psInst->psNext)
++	{
++		if (psInst->eOpcode == ILOCK ||
++			psInst->eOpcode == IRELEASE ||
++			(psInst->eOpcode == ILOADMEMCONST && psInst->u.psLoadMemConst->bSynchronised))
++		{
++			return IMG_TRUE;
++		}
++		if ((g_psInstDesc[psInst->eOpcode].uFlags & DESC_FLAGS_MEMSTORE) != 0)
++		{
++			/*
++				The base instruction may already fetch from several addresses, so
++				moving it is only safe with no store in between at all.
++			*/
++			if (bBaseMoves ||
++				!TestInstructionGroup(psInst->eOpcode, USC_OPT_GROUP_ABS_MEMLDST) ||
++				MemoryAccessesMayAlias(psInst, IMG_FALSE /* bAddressRegChanged */, psNextInst))
++			{
++				return IMG_TRUE;
++			}
++		}
++	}
++	return IMG_FALSE;
++}
++
+ IMG_INTERNAL
+ IMG_VOID BuildFetchInstructions(PINTERMEDIATE_STATE psState)
+ /*****************************************************************************
+@@ -277,6 +329,15 @@
+ 				break;
+ 			}
+ 			
++			/*
++				A store between the two loads might change the memory the later one
++				reads, and the fetch is at the position of the earlier one.
++			*/
++			if (IsMemoryWriteBetween(psBaseInst, psNextInst))
++			{
++				continue;
++			}
++
+ 			uNextInstStaticOffset = GetFetchStaticOffset(psNextInst);
+ 
+ 			/*
+diff --git a/tools/intern/usc2/uscshrd.h b/tools/intern/usc2/uscshrd.h
+--- a/tools/intern/usc2/uscshrd.h
++++ b/tools/intern/usc2/uscshrd.h
+@@ -3789,6 +3789,7 @@
+ IMG_VOID		RemoveInstruction(PDGRAPH_STATE psDepState, PINST psInst);
+ IMG_VOID		MergeInstructions(PDGRAPH_STATE psDepState, IMG_UINT32 uDestInst, IMG_UINT32 uSrcInst, IMG_BOOL bRemoveSrc);
+ IMG_UINT32		AddNewInstToDGraph(PDGRAPH_STATE psDepState, PINST psNewInst);
++IMG_BOOL		MemoryAccessesMayAlias(PINST psInst, IMG_BOOL bAddressRegChanged, PINST psLater);
+ 
+ IMG_VOID		AddDependency(PDGRAPH_STATE psDepState,
+ 								IMG_UINT32 uFrom,

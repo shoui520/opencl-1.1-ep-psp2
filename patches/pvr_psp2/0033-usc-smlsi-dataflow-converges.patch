@@ -1,0 +1,102 @@
+USC: make the SMLSI dataflow converge
+
+The MOE state after a block isn't monotonic in the state before it: an
+operand whose mode is unknown gets an SMLSI and a known mode after it, one
+whose mode is known may keep a different one.  Around a loop the states can
+then cycle forever (a kernel calling sin, cos, pow and fmod never finished
+compiling).  After 16 passes over the blocks, join each block's new state
+with its last one, which only adds unknown operands and so converges; the
+insert pass joins the same way.  Merging also gives an unknown operand's
+(unused) data one value so equal states compare equal.
+
+diff --git a/tools/intern/usc2/groupinst.c b/tools/intern/usc2/groupinst.c
+--- a/tools/intern/usc2/groupinst.c
++++ b/tools/intern/usc2/groupinst.c
+@@ -8629,6 +8629,19 @@
+ 		for functions is ONLY accumulated if FALSE)
+ 	*/
+ 	IMG_BOOL			bInsert;
++
++	/*
++		If not NULL, merges the second state into the first so the result
++		only gains invalid operands.  The state after a block isn't monotonic
++		in the state before it (an invalid operand gets an SMLSI and a known
++		mode after it), so the dataflow can cycle around a loop forever: after
++		uVisits passes over the blocks, the state after each block is joined
++		with the last one (bJoin), which converges; the insert pass joins the
++		same way so it gets the states the first pass found.
++	*/
++	IMG_VOID			(*pfJoin)(IMG_PVOID, IMG_PVOID);
++	IMG_UINT32			uVisits;
++	IMG_BOOL			bJoin;
+ } CALC_STATE, *PCALC_STATE;
+ 
+ static IMG_BOOL GroupInstsDF(PINTERMEDIATE_STATE psState, PCODEBLOCK psBlock, IMG_PVOID pvResult, IMG_PVOID *ppvArgs, IMG_PVOID pvCalcState)
+@@ -8745,7 +8758,18 @@
+ 			hence, this'll handle loops, which'll get a reset at the beginning to
+ 			deal with the merge of loop entry/repeat states (if necessary!).
+ 		*/
+-		IMG_BOOL bDifferent = memcmp(pvResult, pvBlockState, psCalcState->uStateSize) ? IMG_TRUE : IMG_FALSE;
++		IMG_BOOL bDifferent;
++
++		if (psCalcState->pfJoin != NULL && !psCalcState->bInsert &&
++			++psCalcState->uVisits > 16 * psBlock->psOwner->psFunc->sCfg.uNumBlocks)
++		{
++			psCalcState->bJoin = IMG_TRUE;
++		}
++		if (psCalcState->bJoin)
++		{
++			psCalcState->pfJoin(pvBlockState, pvResult);
++		}
++		bDifferent = memcmp(pvResult, pvBlockState, psCalcState->uStateSize) ? IMG_TRUE : IMG_FALSE;
+ 		ASSERT (!bDifferent || !psCalcState->bInsert);
+ 
+ 		/*
+@@ -8796,6 +8820,8 @@
+ 		to modify any blocks)
+ 	*/
+ 	psCalcState->bInsert = IMG_FALSE;
++	psCalcState->uVisits = 0;
++	psCalcState->bJoin = IMG_FALSE;
+ 	DoDataflow(psState, psFunc, IMG_TRUE /*forwards*/,
+ 		psCalcState->uStateSize, asBlockEnds, GroupInstsDF, psCalcState);
+ 
+@@ -9070,6 +9096,14 @@
+ 			/* If the states don't match then mark the destination as invalid. */
+ 			psDest->pbInvalid[i] = IMG_TRUE;
+ 		}
++		if (psDest->pbInvalid[i])
++		{
++			/*
++				The data of an invalid operand isn't used: give it one value so
++				merged states compare equal when they mean the same.
++			*/
++			memcpy(&psDest->psMoeData[i], &sDefaultSmsliState.psMoeData[i], sizeof(psDest->psMoeData[i]));
++		}
+ 	}
+ }
+ 
+@@ -9112,6 +9146,7 @@
+ 	sCalcState.pfProcessBasicBlock = GroupInstructionsBasicBlock;
+ 	sCalcState.pfSetDefault = SMLSI_SetDefault;
+ 	sCalcState.pfMerge = SMLSI_Merge;
++	sCalcState.pfJoin = SMLSI_Merge;
+ 	sCalcState.pfProcessFuncEnd = SMLSI_ProcessFuncEnd;
+ 
+ 	DoMOEPass(psState, psGIState, &sCalcState, NULL);
+@@ -9294,6 +9329,7 @@
+ 	sCalcState.pfProcessBasicBlock = CheckBaseOffsetBasicBlock;
+ 	sCalcState.pfSetDefault = SMBO_SetDefault;
+ 	sCalcState.pfMerge = SMBO_Merge;
++	sCalcState.pfJoin = NULL;
+ 	sCalcState.pfProcessFuncEnd = SMBO_ProcessFuncEnd;
+ 
+ 	DoMOEPass(psState, psGIState, &sCalcState, NULL);
+@@ -9544,6 +9580,7 @@
+ 	sCalcState.pfProcessBasicBlock = CheckFormatControlBasicBlock;
+ 	sCalcState.pfSetDefault = SETFC_SetDefault;
+ 	sCalcState.pfMerge = SETFC_Merge;
++	sCalcState.pfJoin = NULL;
+ 	sCalcState.pfProcessFuncEnd = SETFC_ProcessFuncEnd;
+ 
+ 	DoMOEPass(psState, psGIState, &sCalcState, &sInitialState);

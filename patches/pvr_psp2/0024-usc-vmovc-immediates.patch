@@ -1,0 +1,48 @@
+USC: vector MOVC immediates are six bits
+
+A vector core's IMOVC_I32 becomes IVMOVC_I32, and IsImmediateSourceValid
+allowed both any immediate up to EURASIA_USE_MAXIMUM_IMMEDIATE, past what a
+vector source's register number field holds: the assembler refused e.g. the
+0x7f of a uint to char saturating conversion ("Source 1 immediate value is
+too large (was 127; maximum 63)").  Allow six bits, so the invalid source
+fix-up loads larger ones.
+
+diff --git a/tools/intern/usc2/inst_usc.c b/tools/intern/usc2/inst_usc.c
+index 1dc18e7..a3f1d57 100644
+--- a/tools/intern/usc2/inst_usc.c
++++ b/tools/intern/usc2/inst_usc.c
+@@ -15654,6 +15654,10 @@ IMG_BOOL IsValidImmediateForAbsoluteAddressing(PINTERMEDIATE_STATE	psState,
+ 	return IMG_TRUE;
+ }
+ 
++#if defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554)
++#define SGXVEC_USE_MAXIMUM_IMMEDIATE	((1U << 6) - 1)
++#endif /* defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554) */
++
+ IMG_INTERNAL
+ IMG_BOOL IsImmediateSourceValid(PINTERMEDIATE_STATE	psState,
+ 								PCINST				psInst,
+@@ -15725,13 +15729,20 @@ IMG_BOOL IsImmediateSourceValid(PINTERMEDIATE_STATE	psState,
+ 	#endif /* defined(SUPPORT_SGX545) */
+ 
+ 	#if defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554)
+-	if (psInst->eOpcode == IVMOVC_I32)
++	if (
++			psInst->eOpcode == IVMOVC_I32 ||
++			(
++				psInst->eOpcode == IMOVC_I32 &&
++				(psState->psTargetFeatures->ui32Flags & SGX_FEATURE_FLAGS_USE_VEC34) != 0
++			)
++	   )
+ 	{
+ 		/*
+ 			Check if the immediate is in the range which can be directly encoded
+-			in an instruction source.
++			in an instruction source: a vector instruction's register number
++			fields are six bits, and a vector core's IMOVC_I32 becomes IVMOVC_I32.
+ 		*/
+-		if (uImmediate <= EURASIA_USE_MAXIMUM_IMMEDIATE)
++		if (uImmediate <= SGXVEC_USE_MAXIMUM_IMMEDIATE)
+ 		{
+ 			return IMG_TRUE;
+ 		}

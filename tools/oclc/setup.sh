@@ -84,7 +84,10 @@ for apk in musl-dev libgcc libstdc++; do
 	tar -xzf "$DL/$apk.apk" -C "$A" --exclude='.PKGINFO' --exclude='.SIGN.*' 2>/dev/null ||
 		die "couldn't unpack $apk.apk"
 done
-cp "$DL/liboclcompiler.so" "$DL/libusc_img.so" "$A/usr/lib/pvr/"
+cp "$DL/libusc_img.so" "$A/usr/lib/pvr/"
+# its unordered float comparisons marked for usc_shim.c
+python3 "$ROOT/tools/oclc/patch_frontend.py" "$DL/liboclcompiler.so" "$A/usr/lib/pvr/liboclcompiler.so" ||
+	die "patching liboclcompiler.so failed"
 
 # --- PVR_PSP2's USC, USP and assembler with patches/pvr_psp2 applied ---
 

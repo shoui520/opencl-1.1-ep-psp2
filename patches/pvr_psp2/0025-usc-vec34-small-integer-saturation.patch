@@ -1,0 +1,204 @@
+USC: saturating 8 and 16-bit integer conversions on vec34
+
+They were PCKs (e.g. pcks8s16, unpcku16s16, unpcks16u8), which a vector
+core doesn't have in scalar form and groupinst.c only rewrites to vector
+PCKs for U16U16, S16S8 and U16U8.  Extend the source to 32 bits and clamp it
+to the destination's range there instead.
+
+diff --git a/tools/intern/usc2/icvt_i32.c b/tools/intern/usc2/icvt_i32.c
+index ba66013..80112ba 100644
+--- a/tools/intern/usc2/icvt_i32.c
++++ b/tools/intern/usc2/icvt_i32.c
+@@ -3313,6 +3313,167 @@ IMG_VOID ConvertMinMaxInstructionInt32(PINTERMEDIATE_STATE	psState,
+ 
+ }
+ 
++#if defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554)
++static IMG_BOOL IsSmallIntegerFormat(UF_REGFORMAT eFormat)
++/*****************************************************************************
++ FUNCTION	: IsSmallIntegerFormat
++
++ PURPOSE	: Check for an 8-bit or 16-bit integer format.
++
++ PARAMETERS	: eFormat		- Format to check.
++
++ RETURNS	: TRUE or FALSE.
++*****************************************************************************/
++{
++	return (eFormat == UF_REGFORMAT_I8_UN || eFormat == UF_REGFORMAT_U8_UN ||
++			eFormat == UF_REGFORMAT_I16 || eFormat == UF_REGFORMAT_U16) ? IMG_TRUE : IMG_FALSE;
++}
++
++static IMG_VOID SmallIntegerRange(UF_REGFORMAT eFormat, IMG_PINT32 piMin, IMG_PINT32 piMax, IMG_PUINT32 puWidth)
++/*****************************************************************************
++ FUNCTION	: SmallIntegerRange
++
++ PURPOSE	: Get the values and the width of an 8-bit or 16-bit integer format.
++
++ PARAMETERS	: eFormat		- Format.
++			  piMin, piMax	- Return the least and the greatest value.
++			  puWidth		- Returns the width in bits.
++
++ RETURNS	: Nothing.
++*****************************************************************************/
++{
++	switch (eFormat)
++	{
++		case UF_REGFORMAT_I8_UN: *piMin = -128; *piMax = 127; *puWidth = 8; break;
++		case UF_REGFORMAT_U8_UN: *piMin = 0; *piMax = 255; *puWidth = 8; break;
++		case UF_REGFORMAT_I16: *piMin = -32768; *piMax = 32767; *puWidth = 16; break;
++		default: *piMin = 0; *piMax = 65535; *puWidth = 16; break;
++	}
++}
++
++static IMG_VOID ClampToBound(PINTERMEDIATE_STATE psState, PCODEBLOCK psBlock, PARG psValue,
++							 IMG_INT32 iBound, IMG_BOOL bMax)
++/*****************************************************************************
++ FUNCTION	: ClampToBound
++
++ PURPOSE	: Replace a signed 32-bit value by its maximum or minimum with a
++			  constant.
++
++ PARAMETERS	: psState		- Compiler state.
++			  psBlock		- Block to append to.
++			  psValue		- Value, replaced by a new temporary holding the result.
++			  iBound		- Constant.
++			  bMax			- TRUE for the maximum, FALSE for the minimum.
++
++ RETURNS	: Nothing.
++*****************************************************************************/
++{
++	PINST	psLimmInst;
++	ARG		sBound;
++	ARG		sResult;
++
++	InitInstArg(&sBound);
++	sBound.uType = USEASM_REGTYPE_TEMP;
++	sBound.uNumber = GetNextRegister(psState);
++	sBound.eFmt = UF_REGFORMAT_F32;
++
++	psLimmInst = AllocateInst(psState, NULL);
++	SetOpcode(psState, psLimmInst, ILIMM);
++	psLimmInst->asDest[0] = sBound;
++	psLimmInst->asArg[0].uType = USEASM_REGTYPE_IMMEDIATE;
++	psLimmInst->asArg[0].uNumber = (IMG_UINT32)iBound;
++	AppendInst(psState, psBlock, psLimmInst);
++
++	InitInstArg(&sResult);
++	sResult.uType = USEASM_REGTYPE_TEMP;
++	sResult.uNumber = GetNextRegister(psState);
++	sResult.eFmt = UF_REGFORMAT_F32;
++
++	ConvertMinMaxInstructionInt32(psState,
++								  psBlock,
++								  &sResult,
++								  USC_PREDREG_NONE,
++								  IMG_FALSE /* bPredNegate */,
++								  psValue,
++								  IMG_FALSE /* bNegateA */,
++								  &sBound,
++								  IMG_FALSE /* bNegateB */,
++								  IMG_TRUE /* bSigned */,
++								  bMax);
++	*psValue = sResult;
++}
++
++static IMG_VOID ClampSmallInteger(PINTERMEDIATE_STATE	psState,
++								  PCODEBLOCK			psBlock,
++								  PARG					psDest,
++								  PARG					psSrc,
++								  UF_REGFORMAT			eSrcFormat,
++								  UF_REGFORMAT			eDestFormat,
++								  IMG_UINT32			uPredSrc,
++								  IMG_BOOL				bPredNegate)
++/*****************************************************************************
++ FUNCTION	: ClampSmallInteger
++
++ PURPOSE	: Saturating conversion between 8-bit and 16-bit integer formats
++			  without PCK: the source is extended to 32 bits, where it is
++			  clamped to the destination format's range.
++
++ PARAMETERS	: psState			- Compiler state.
++			  psBlock			- Block to append to.
++			  psDest			- Destination.
++			  psSrc				- Source.
++			  eSrcFormat		- Source format.
++			  eDestFormat		- Destination format.
++			  uPredSrc			- Predicate for the destination update.
++			  bPredNegate
++
++ RETURNS	: Nothing.
++*****************************************************************************/
++{
++	IMG_INT32	iSrcMin, iSrcMax, iDestMin, iDestMax;
++	IMG_UINT32	uSrcWidth, uDestWidth;
++	PINST		psMovInst;
++	ARG			sValue;
++
++	SmallIntegerRange(eSrcFormat, &iSrcMin, &iSrcMax, &uSrcWidth);
++	SmallIntegerRange(eDestFormat, &iDestMin, &iDestMax, &uDestWidth);
++
++	InitInstArg(&sValue);
++	sValue.uType = USEASM_REGTYPE_TEMP;
++	sValue.uNumber = GetNextRegister(psState);
++	sValue.eFmt = UF_REGFORMAT_F32;
++
++	psMovInst = AllocateInst(psState, NULL);
++	SetOpcode(psState, psMovInst, IMOV);
++	psMovInst->asDest[0] = sValue;
++	if (iSrcMin < 0)
++	{
++		SignExtendInteger(psState, psBlock, uSrcWidth, psSrc, 0 /* uByteOffset */, &psMovInst->asArg[0]);
++	}
++	else
++	{
++		ZeroExtendInteger(psState, psBlock, uSrcWidth, psSrc, 0 /* uByteOffset */, &psMovInst->asArg[0]);
++	}
++	AppendInst(psState, psBlock, psMovInst);
++
++	if (iDestMin > iSrcMin)
++	{
++		ClampToBound(psState, psBlock, &sValue, iDestMin, IMG_TRUE /* bMax */);
++	}
++	if (iDestMax < iSrcMax)
++	{
++		ClampToBound(psState, psBlock, &sValue, iDestMax, IMG_FALSE /* bMax */);
++	}
++
++	psMovInst = AllocateInst(psState, NULL);
++	SetOpcode(psState, psMovInst, IMOV);
++	SetPredicate(psState, psMovInst, uPredSrc, bPredNegate);
++	psMovInst->asDest[0] = *psDest;
++	psMovInst->asArg[0] = sValue;
++	AppendInst(psState, psBlock, psMovInst);
++}
++#endif /* defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554) */
++
+ IMG_INTERNAL
+ IMG_VOID ExpandFTRCInstruction(PINTERMEDIATE_STATE		psState,
+ 							   PINST					psInst)
+@@ -5111,6 +5272,24 @@ PCODEBLOCK ConvertIntegerMOV(PINTERMEDIATE_STATE		psState,
+ 	}
+ 	else if(psState->uCompilerFlags & UF_OPENCL)
+ 	{
++		#if defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554)
++		/*
++			A vector core has no scalar PCK, and the vector one only for some
++			of these format pairs: clamp in 32 bits instead.
++		*/
++		if (
++				(psState->psTargetFeatures->ui32Flags & SGX_FEATURE_FLAGS_USE_VEC34) != 0 &&
++				uSat != 0 &&
++				eSrcFormat != eDestFormat &&
++				IsSmallIntegerFormat(eSrcFormat) &&
++				IsSmallIntegerFormat(eDestFormat)
++		   )
++		{
++			ClampSmallInteger(psState, psBlock, psDest, psSrc, eSrcFormat, eDestFormat, uPredSrc, bPredNegate);
++			return psBlock;
++		}
++		#endif /* defined(SUPPORT_SGX543) || defined(SUPPORT_SGX544) || defined(SUPPORT_SGX554) */
++
+ 		/* Conversions from 8-bit formats */
+ 		if
+ 		(

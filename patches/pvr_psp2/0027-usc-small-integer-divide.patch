@@ -1,0 +1,141 @@
+USC: exact 8 and 16-bit integer division
+
+OpenCL's x / y and x % y on uchar and ushort (and their vectors) reach USC
+as a DIV or DIV2 in U8_UN or U16.  U8_UN went to ExpandFloatDIV, which made
+a UFOP_RECIP in U8_UN that nothing converts (icvt_i32.c: imgabort), and the
+16-bit expansion multiplies by the floating point reciprocal and truncates,
+so an exact quotient whose reciprocal rounds down comes out one too small.
+Both widen to 32 bits and use the 32-bit integer divide.
+
+diff --git a/tools/intern/usc2/icvt_core.c b/tools/intern/usc2/icvt_core.c
+index 2981ff5..5a89a5d 100644
+--- a/tools/intern/usc2/icvt_core.c
++++ b/tools/intern/usc2/icvt_core.c
+@@ -12324,6 +12324,99 @@ static IMG_VOID ExpandIntegerDIV(PINTERMEDIATE_STATE	psState,
+ 	}
+ }
+ 
++static IMG_VOID ExpandSmallIntegerDIV(PINTERMEDIATE_STATE	psState,
++									  PUNIFLEX_INST			psOrigInst,
++									  PINPUT_PROGRAM		psProg)
++/*****************************************************************************
++ FUNCTION	: ExpandSmallIntegerDIV
++
++ PURPOSE	: Expand a DIV or DIV2 instruction on 8 or 16-bit integer data
++			  as the 32-bit integer divide, which is exact (the 16-bit
++			  expansion multiplies by a floating point reciprocal).
++
++ PARAMETERS	: psState			- Compiler state.
++			  psOrigInst		- Original instruction.
++			  psProg			- Program to add the expanded instruction to.
++
++ RETURNS	: Nothing.
++*****************************************************************************/
++{
++	UF_REGFORMAT	eSmallFormat = psOrigInst->asSrc[0].eFormat;
++	UF_REGFORMAT	eWideFormat;
++	UNIFLEX_INST	sWideInst;
++	PUNIFLEX_INST	psInst;
++	IMG_UINT32		uDestMask;
++	IMG_UINT32		uQuotient = psState->uInputTempRegisterCount++;
++	IMG_UINT32		uRemainder = psState->uInputTempRegisterCount++;
++	IMG_BOOL		bDest2 = (psOrigInst->eOpCode == UFOP_DIV2) ? IMG_TRUE : IMG_FALSE;
++	IMG_UINT32		uArg;
++
++	if (eSmallFormat == UF_REGFORMAT_I16 || eSmallFormat == UF_REGFORMAT_I8_UN)
++	{
++		eWideFormat = UF_REGFORMAT_I32;
++	}
++	else
++	{
++		eWideFormat = UF_REGFORMAT_U32;
++	}
++
++	uDestMask = psOrigInst->sDest.u.byMask;
++	if (bDest2)
++	{
++		uDestMask |= psOrigInst->sDest2.u.byMask;
++	}
++
++	sWideInst = *psOrigInst;
++	sWideInst.uPredicate = UF_PRED_NONE;
++
++	/*
++		WIDE_SRCn = (32-BIT)SRCn
++	*/
++	for (uArg = 0; uArg < 2; uArg++)
++	{
++		IMG_UINT32	uWide = psState->uInputTempRegisterCount++;
++
++		psInst = AllocInputInst(psState, psProg, psOrigInst);
++		psInst->eOpCode = UFOP_MOV;
++		BuildInputTempRegDest(&psInst->sDest, uWide, eWideFormat, uDestMask);
++		psInst->asSrc[0] = psOrigInst->asSrc[uArg];
++		psInst->uPredicate = UF_PRED_NONE;
++
++		BuildInputTempRegSrc(&sWideInst.asSrc[uArg], uWide, eWideFormat, UFREG_SWIZ_NONE);
++	}
++
++	/*
++		QUOTIENT(+REMAINDER) = WIDE_SRC0 / WIDE_SRC1
++	*/
++	BuildInputTempRegDest(&sWideInst.sDest, uQuotient, eWideFormat, psOrigInst->sDest.u.byMask);
++	if (bDest2)
++	{
++		BuildInputTempRegDest(&sWideInst.sDest2, uRemainder, eWideFormat, psOrigInst->sDest2.u.byMask);
++	}
++	ExpandIntegerDIV(psState, &sWideInst, psProg);
++
++	/*
++		DEST = QUOTIENT
++		DEST2 = REMAINDER
++	*/
++	if (psOrigInst->sDest.u.byMask != 0)
++	{
++		psInst = AllocInputInst(psState, psProg, psOrigInst);
++		psInst->eOpCode = UFOP_MOV;
++		psInst->sDest = psOrigInst->sDest;
++		BuildInputTempRegSrc(&psInst->asSrc[0], uQuotient, eWideFormat, UFREG_SWIZ_NONE);
++		psInst->uPredicate = psOrigInst->uPredicate;
++	}
++	if (bDest2 && psOrigInst->sDest2.u.byMask != 0)
++	{
++		psInst = AllocInputInst(psState, psProg, psOrigInst);
++		psInst->eOpCode = UFOP_MOV;
++		psInst->sDest = psOrigInst->sDest2;
++		BuildInputTempRegSrc(&psInst->asSrc[0], uRemainder, eWideFormat, UFREG_SWIZ_NONE);
++		psInst->uPredicate = psOrigInst->uPredicate;
++	}
++}
++
+ static
+ IMG_VOID GenerateFloor(PINTERMEDIATE_STATE	psState,
+ 					   PINPUT_PROGRAM		psProg,
+@@ -14254,9 +14347,11 @@ static IMG_VOID ExpandMacro(PINTERMEDIATE_STATE	psState,
+ 					ExpandIntegerDIV(psState, psOrigInst, psProg);
+ 				}
+ 				else if (psOrigInst->asSrc[0].eFormat == UF_REGFORMAT_I16 ||
+-						 psOrigInst->asSrc[0].eFormat == UF_REGFORMAT_U16)
++						 psOrigInst->asSrc[0].eFormat == UF_REGFORMAT_U16 ||
++						 psOrigInst->asSrc[0].eFormat == UF_REGFORMAT_I8_UN ||
++						 psOrigInst->asSrc[0].eFormat == UF_REGFORMAT_U8_UN)
+ 				{
+-					ExpandInt16DIV(psState, psOrigInst, psProg);
++					ExpandSmallIntegerDIV(psState, psOrigInst, psProg);
+ 				}
+ 				else
+ 				{
+@@ -14271,9 +14366,11 @@ static IMG_VOID ExpandMacro(PINTERMEDIATE_STATE	psState,
+ 					ExpandIntegerDIV(psState, psOrigInst, psProg);
+ 				}
+ 				else if (psOrigInst->asSrc[0].eFormat == UF_REGFORMAT_I16 ||
+-						 psOrigInst->asSrc[0].eFormat == UF_REGFORMAT_U16)
++						 psOrigInst->asSrc[0].eFormat == UF_REGFORMAT_U16 ||
++						 psOrigInst->asSrc[0].eFormat == UF_REGFORMAT_I8_UN ||
++						 psOrigInst->asSrc[0].eFormat == UF_REGFORMAT_U8_UN)
+ 				{
+-					ExpandInt16DIV(psState, psOrigInst, psProg);
++					ExpandSmallIntegerDIV(psState, psOrigInst, psProg);
+ 				}
+ 				else
+ 				{

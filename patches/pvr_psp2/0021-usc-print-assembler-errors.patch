@@ -1,0 +1,67 @@
+USC: print what the assembler couldn't encode
+
+UseAssemblerError dropped the assembler's message and aborted, so a failed
+compile said only "UF_ERR_INTERNAL".
+
+diff --git a/tools/intern/usc2/hw.c b/tools/intern/usc2/hw.c
+index 6caad17..a75a656 100644
+--- a/tools/intern/usc2/hw.c
++++ b/tools/intern/usc2/hw.c
+@@ -18,6 +18,8 @@
+  * $Log: hw.c $
+  **************************************************************************/
+ 
++#include <stdarg.h>
++#include <stdio.h>
+ #include "uscshrd.h"
+ #include "bitops.h"
+ #include "layout.h"
+@@ -41,8 +43,16 @@ static IMG_VOID UseAssemblerError(IMG_PVOID pvContext, PUSE_INST psInst, IMG_CHA
+ {
+ 	PINTERMEDIATE_STATE psState = (PINTERMEDIATE_STATE)pvContext;
+ 
++	va_list		ap;
++
+ 	PVR_UNREFERENCED_PARAMETER(psInst);
+-	PVR_UNREFERENCED_PARAMETER(pszFmt);
++	/* say what couldn't be encoded before giving up */
++	va_start(ap, pszFmt);
++	fprintf(stderr, "USC: assembler: ");
++	vfprintf(stderr, pszFmt, ap);
++	fprintf(stderr, " (opcode %u, flags %08x %08x %08x)\n", psInst->uOpcode, psInst->uFlags1,
++			psInst->uFlags2, psInst->uFlags3);
++	va_end(ap);
+ 
+ 	imgabort();
+ }
+diff --git a/tools/intern/usc2/uspbin.c b/tools/intern/usc2/uspbin.c
+index 0b20c3d..2e1b9ab 100644
+--- a/tools/intern/usc2/uspbin.c
++++ b/tools/intern/usc2/uspbin.c
+@@ -19,6 +19,8 @@
+  * of 4.
+  *  --- Revision Logs Removed --- -iftikhar.ahmad
+  *****************************************************************************/
++#include <stdarg.h>
++#include <stdio.h>
+ #include "uscshrd.h"
+ #include "bitops.h"
+ #include "uspbin.h"
+@@ -261,8 +263,16 @@ static IMG_VOID UseAssemblerError(IMG_PVOID pvContext,
+ {
+ 	PINTERMEDIATE_STATE psState = (PINTERMEDIATE_STATE)pvContext;
+ 
++	va_list		ap;
++
+ 	PVR_UNREFERENCED_PARAMETER(psInst);
+-	PVR_UNREFERENCED_PARAMETER(pszFmt);
++	/* say what couldn't be encoded before giving up */
++	va_start(ap, pszFmt);
++	fprintf(stderr, "USC: assembler: ");
++	vfprintf(stderr, pszFmt, ap);
++	fprintf(stderr, " (opcode %u, flags %08x %08x %08x)\n", psInst->uOpcode, psInst->uFlags1,
++			psInst->uFlags2, psInst->uFlags3);
++	va_end(ap);
+ 	imgabort();
+ }
+ 
