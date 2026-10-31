@@ -64,7 +64,9 @@ OPS = {
     'finish': (18, ''),
     'wait': (19, 'slot'),
     'release': (20, 'id'),
+    'ep_api': (21, ''),					# output: failures, then EP_API_REPORT bytes of text
 }
+EP_API_REPORT = 4096
 
 CL_MEM_READ_WRITE, CL_MEM_WRITE_ONLY, CL_MEM_READ_ONLY = 1, 2, 4
 CL_MEM_USE_HOST_PTR, CL_MEM_ALLOC_HOST_PTR = 8, 16
@@ -140,8 +142,9 @@ class ApiCase:
     """A script of OpenCL calls, script(s, rng) (src: its kernels, or None);
     outputs and return codes must match exactly."""
 
-    def __init__(self, name, src, script, options=''):
+    def __init__(self, name, src, script, options='', check=None):
         self.name, self.src, self.script, self.options = name, src, script, options
+        self.check = check		# f(outputs) -> [error strings], for outputs not compared
 
 
 class Script:
@@ -176,6 +179,8 @@ def output_size(name, kw):
         return kw['size'] if kw['flags'] & CL_MAP_READ else 0
     if name == 'status':
         return 4
+    if name == 'ep_api':
+        return 4 + EP_API_REPORT
     return 0
 
 
@@ -327,6 +332,8 @@ def run_reference(script, src, options):
                 cl.wait_for_events([events[kw['slot']]])
             elif name == 'release':
                 bufs.pop(kw['id']).release()
+            elif name == 'ep_api':
+                pass			# the device checks itself
             codes.append(0)
         except cl.Error as e:
             codes.append(e.code)
@@ -377,20 +384,23 @@ def build(work, names):
             try:
                 kernels = clbin.compile_kernels(src, os.path.join(work, 'build'), case.options,
                                                 base)
-                binaries[key] = (clbin.pack(kernels), {k['name']: k for k in kernels})
+                binaries[key] = (kernels, {k['name']: k for k in kernels})
             except clbin.CompileError as e:
                 binaries[key] = e
-        b = binaries.get(key, (b'', {}))
+        b = binaries.get(key, ([], {}))
         if isinstance(b, Exception):
             print('%-24s SKIP: %s' % (case.name, b))
             continue
-        binary, kernels = b
+        program, kernels = b
+        binary = clbin.pack(program) if program else b''
         rng = np.random.default_rng(zlib.crc32(case.name.encode()))
         inputs = {}
         if isinstance(case, Case):
             if case.kernel not in kernels:
                 print('%-24s SKIP: kernel not found' % case.name)
                 continue
+            # a kernel case only creates its kernel: its binary needs no others
+            binary = clbin.pack([kernels[case.kernel]])
             inputs = {i: a.make(rng) for i, a in enumerate(case.args) if isinstance(a, Buf)}
             script = case_script(case, kernels[case.kernel]['args'], inputs)
         else:
@@ -509,6 +519,8 @@ def check(work, results_path):
                     bad = np.nonzero(outs[j] != exp['out%d' % j])[0]
                     errs.append('output %d: %d bytes differ, first at %d (device %d, pocl %d)' % (
                         j, len(bad), bad[0], outs[j][bad[0]], exp['out%d' % j][bad[0]]))
+            if case.check:
+                errs += case.check(outs)
         print('%-24s %s %8.3f ms' % (name, 'FAIL' if errs else 'ok  ', time_us / 1000.0))
         for e in errs:
             print('    ' + e)

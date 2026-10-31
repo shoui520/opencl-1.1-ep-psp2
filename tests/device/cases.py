@@ -627,3 +627,8 @@ CASES += [
     Case('sha_rounds%d' % n, CT, 'sha_rounds', (64,), [Buf('u4', 64 * 64), Buf('u4', 64 * 8, 'zeros'),
          Buf('u4', 64, values=SHA_K), Val(np.int32(n))]) for n in (1, 2, 3, 8, 64)
 ]
+
+
+from ep_cases import EP_CASES  # noqa: E402
+
+CASES += EP_CASES

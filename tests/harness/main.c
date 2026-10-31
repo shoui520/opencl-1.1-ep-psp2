@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ep_api.h"
+
 #define PACK_PATH	"ux0:data/ocl/tests.pak"
 #define RESULTS_PATH	"ux0:data/ocl/results.pak"
 
@@ -36,13 +38,14 @@
 #define GUARD		128	/* CL_DEVICE_MEM_BASE_ADDR_ALIGN: where a sub-buffer can start */
 #define GUARD_BYTE	0xA5
 #define BAD_PACK	((cl_int)0x80EC0001)
+#define EP_API_REPORT	4096	/* OP_EP_API's output: failures, then their text */
 
 #define ALIGN(x, a)	(((x) + ((a) - 1)) & ~((a) - 1))
 
 enum {
 	OP_BUFFER = 1, OP_SUBBUFFER, OP_KERNEL, OP_ARG_MEM, OP_ARG_VALUE, OP_ARG_LOCAL, OP_NDRANGE,
 	OP_READ, OP_WRITE, OP_COPY, OP_READ_RECT, OP_WRITE_RECT, OP_COPY_RECT, OP_MAP,
-	OP_USER_EVENT, OP_SET_STATUS, OP_STATUS, OP_FINISH, OP_WAIT, OP_RELEASE,
+	OP_USER_EVENT, OP_SET_STATUS, OP_STATUS, OP_FINISH, OP_WAIT, OP_RELEASE, OP_EP_API,
 };
 
 typedef struct pack_test {
@@ -105,6 +108,8 @@ static uint32_t output_size(const uint32_t *w)
 		return w[4] & CL_MAP_READ ? w[6] : 0;
 	case OP_STATUS:
 		return 4;
+	case OP_EP_API:
+		return 4 + EP_API_REPORT;
 	}
 	return 0;
 }
@@ -123,6 +128,7 @@ static cl_int run_op(test_state *s, const uint32_t *w, uint8_t *out)
 	size_t g[3], o[3], one[3] = { 1, 1, 1 };
 	SceUInt64 t0;
 	void *ptr;
+	int32_t n;
 
 	if (ws < 0 || es < 0 || (wait && !*wait))
 		return BAD_PACK;
@@ -292,6 +298,12 @@ static cl_int run_op(test_state *s, const uint32_t *w, uint8_t *out)
 		err = clReleaseMemObject(s->buf[w[3]]);
 		s->buf[w[3]] = NULL;
 		return err;
+	case OP_EP_API:
+		if (!s->prog)
+			return BAD_PACK;
+		n = ep_api_run(s->ctx, s->q, s->dev, s->prog, (char *)out + 4, EP_API_REPORT, tlog);
+		memcpy(out, &n, 4);
+		return CL_SUCCESS;
 	}
 	return BAD_PACK;
 }
@@ -348,7 +360,7 @@ static const char *op_name(uint32_t op)
 	static const char *names[] = {
 		"?", "buffer", "subbuffer", "kernel", "arg_mem", "arg_value", "arg_local", "ndrange",
 		"read", "write", "copy", "read_rect", "write_rect", "copy_rect", "map", "user_event",
-		"set_status", "status", "finish", "wait", "release",
+		"set_status", "status", "finish", "wait", "release", "ep_api",
 	};
 
 	return op < sizeof(names) / sizeof(names[0]) ? names[op] : "?";

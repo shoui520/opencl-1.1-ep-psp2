@@ -18,7 +18,7 @@ set(VITA_VERSION "01.00")
 set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 add_subdirectory(${ROOT}/runtime/cl opencl)
 
-add_executable(${PROJECT_NAME} main.c)
+add_executable(${PROJECT_NAME} main.c ep_api.c)
 target_compile_options(${PROJECT_NAME} PRIVATE -O2 -Wall)
 target_link_libraries(${PROJECT_NAME} OpenCL)
 
