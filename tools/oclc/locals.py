@@ -180,7 +180,8 @@ def find_locals(src, toks, k):
             j += 1
         if j < end and toks[j].text == ';':
             stmt = toks[i:j]
-            if any(t.text in LOCAL for t in stmt[:4]) and stmt[0].text not in ('return',):
+            # not a cast to a __local pointer, as in ((__local int *)p)[0] = x;
+            if any(t.text in LOCAL for t in list(top_level(stmt))[:4]) and stmt[0].text not in ('return',):
                 decls = parse_local_decl(src, stmt)
                 if decls:
                     k.locals.append(((i, j), decls))

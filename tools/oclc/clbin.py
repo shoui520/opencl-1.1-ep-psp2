@@ -31,6 +31,7 @@ KERNEL_WORDS = 20
 ARG_WORDS = 8
 ADDR_VALUE, ADDR_LOCAL = 0, 1
 
+FIRST_ARG_REG = 20		# runtime/gpu/gxc_kernel.h GXC_C_ARGS
 REQD = re.compile(r'reqd_work_group_size\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)')
 
 
@@ -52,6 +53,37 @@ def reqd_sizes(src):
         if r:
             out[n.group(1)] = tuple(int(x) for x in r.groups())
     return out
+
+
+def compact_channels(hw, k):
+    """The front end numbers the constant registers of the whole program, so a
+    program of many kernels can pass the runtime's table: number the ones a
+    kernel uses from c20 (GXC_C_ARGS, after the work-item constants) up, in
+    order, so an argument of several registers stays in one piece."""
+    # every kernel's static constants list the whole program's: the shader
+    # reads constants only through its loads, so keep the ones it loads
+    loaded = {l['src'] for l in hw['reg_consts'] if l['fmt'] == mkgxp.CONST_F32}
+    hw['static_consts'] = {c: v for c, v in hw['static_consts'].items() if c in loaded}
+    regs = {c // 4 for c in loaded}
+    for space, creg, elem, comps, _ in k['args']:
+        regs.update(range(creg, creg + (comps + 3) // 4))
+    regs.update(c // 4 for _, c in k['private'])
+    if k['hidden']:
+        regs.add(k['hidden'][0])
+    used = sorted(r for r in regs if r >= FIRST_ARG_REG)
+    new = {r: FIRST_ARG_REG + i for i, r in enumerate(used)}
+
+    def ch(c):
+        return new[c // 4] * 4 + c % 4 if c // 4 in new else c
+    for l in hw['reg_consts']:
+        if l['fmt'] == mkgxp.CONST_F32:
+            l['src'] = ch(l['src'])
+    hw['static_consts'] = {ch(c): v for c, v in hw['static_consts'].items()}
+    k['args'] = [(space, new.get(creg, creg), elem, comps, ref)
+                 for space, creg, elem, comps, ref in k['args']]
+    k['private'] = [(size, ch(c)) for size, c in k['private']]
+    if k['hidden']:
+        k['hidden'] = (new.get(k['hidden'][0], k['hidden'][0]), k['hidden'][1])
 
 
 def compile_kernels(src, work, options='', base='program'):
@@ -91,15 +123,9 @@ def compile_kernels(src, work, options='', base='program'):
         if k['program'] < 0:
             raise CompileError('%s: no program for the kernel' % k['name'])
         hw = hwshader.parse(open('%s.%d.hw' % (prefix, k['program']), 'rb').read())
-        try:
-            k['gxp'] = mkgxp.build(hw)
-        except mkgxp.PackError as e:
-            raise CompileError('%s: %s' % (k['name'], e))
-        k['map'] = mkgxp.const_map(hw)
         # the front end lists every private array of the program for each
         # kernel: keep the ones whose base this kernel loads
-        nloads = struct.unpack_from('<I', k['map'], 8)[0]
-        loaded = set(struct.unpack_from('<%dI' % (2 * nloads), k['map'], 16)[1::2])
+        loaded = {l['src'] for l in hw['reg_consts'] if l['fmt'] == mkgxp.CONST_F32}
         k['private'] = [p for p in k['private'] if p[1] in loaded]
         k['hidden'] = None
         if local_info.get(k['name']):
@@ -108,6 +134,12 @@ def compile_kernels(src, work, options='', base='program'):
             if space != ADDR_LOCAL:
                 raise CompileError('%s: the hidden __local argument is missing' % k['name'])
             k['hidden'] = (creg, elem)
+        compact_channels(hw, k)
+        try:
+            k['gxp'] = mkgxp.build(hw)
+        except mkgxp.PackError as e:
+            raise CompileError('%s: %s' % (k['name'], e))
+        k['map'] = mkgxp.const_map(hw)
         k['reqd'] = reqd.get(k['name'], (0, 0, 0))
     return kernels
 
